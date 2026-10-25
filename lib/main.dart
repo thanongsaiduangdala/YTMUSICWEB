@@ -438,6 +438,114 @@ final EqSettings eqState = EqSettings();
 
 /// Shows what the web page is playing in the Android notification / lock screen,
 /// and forwards the notification buttons back to the page.
+/// iPhone: talks to FxPlayer.swift (AVAudioEngine). Mirrors the small part of
+/// just_audio's AudioPlayer that WebAudioHandler needs.
+class IosFxEngine {
+  static const MethodChannel _ch = MethodChannel('ytmusicweb/fxplayer');
+  final _changes = StreamController<void>.broadcast();
+  final _states = StreamController<ProcessingState>.broadcast();
+
+  bool playing = false;
+  ProcessingState state = ProcessingState.idle;
+  Duration? duration;
+  Duration _pos = Duration.zero;
+  DateTime _stamp = DateTime.now();
+
+  IosFxEngine() {
+    _ch.setMethodCallHandler(_onNative);
+  }
+
+  Stream<void> get changes => _changes.stream;
+  Stream<ProcessingState> get processingStates => _states.stream;
+
+  Duration get position {
+    if (!playing) return _pos;
+    final p = _pos + DateTime.now().difference(_stamp);
+    final d = duration;
+    return (d != null && p > d) ? d : p;
+  }
+
+  void _take(Map<String, dynamic>? r) {
+    if (r == null) return;
+    final p = r['pos'];
+    if (p is num) {
+      _pos = Duration(milliseconds: (p * 1000).round());
+      _stamp = DateTime.now();
+    }
+    final d = r['dur'];
+    if (d is num) duration = Duration(milliseconds: (d * 1000).round());
+  }
+
+  Future<dynamic> _onNative(MethodCall c) async {
+    if (c.method != 'event' || c.arguments is! Map) return null;
+    final m = Map<String, dynamic>.from(c.arguments as Map);
+    _take(m);
+    switch (m['type']) {
+      case 'completed':
+        playing = false;
+        state = ProcessingState.completed;
+        _changes.add(null);
+        _states.add(state);
+        break;
+      case 'paused':
+        playing = false;
+        _changes.add(null);
+        break;
+    }
+    return null;
+  }
+
+  Future<Duration?> load(String path) async {
+    playing = false;
+    state = ProcessingState.loading;
+    _pos = Duration.zero;
+    duration = null;
+    _changes.add(null);
+    try {
+      final r = await _ch.invokeMapMethod<String, dynamic>('load', {'path': path});
+      _take(r);
+      state = ProcessingState.ready;
+      _changes.add(null);
+      return duration;
+    } catch (_) {
+      state = ProcessingState.idle;
+      _changes.add(null);
+      rethrow;
+    }
+  }
+
+  Future<void> play() async {
+    _take(await _ch.invokeMapMethod<String, dynamic>('play'));
+    playing = true;
+    state = ProcessingState.ready;
+    _changes.add(null);
+  }
+
+  Future<void> pause() async {
+    playing = false; // first, so the position stops growing at once
+    _take(await _ch.invokeMapMethod<String, dynamic>('pause'));
+    _changes.add(null);
+  }
+
+  Future<void> seek(Duration d) async {
+    _take(await _ch.invokeMapMethod<String, dynamic>(
+        'seek', {'seconds': d.inMilliseconds / 1000}));
+    _changes.add(null);
+  }
+
+  Future<void> stop() async {
+    playing = false;
+    state = ProcessingState.idle;
+    _pos = Duration.zero;
+    try {
+      await _ch.invokeMethod('stop');
+    } catch (_) {}
+    _changes.add(null);
+  }
+
+  Future<void> applyFx(Map<String, dynamic> fx) => _ch.invokeMethod('fx', fx);
+}
+
 class WebAudioHandler extends BaseAudioHandler {
   /// Set by the page: runs JavaScript inside the webview.
   Future<void> Function(String js)? runJs;
@@ -479,19 +587,51 @@ class WebAudioHandler extends BaseAudioHandler {
   /// Set by the page: called when on-device playback stops.
   VoidCallback? localStopped;
 
+  // iPhone: on-device songs play through our own AVAudioEngine player
+  // (ios/Runner/FxPlayer.swift) because just_audio has no equaliser on iOS.
+  // On Android this object is never created and nothing changes.
+  late final IosFxEngine _ios = IosFxEngine();
+
+  bool get _lPlaying => Platform.isIOS ? _ios.playing : _player.playing;
+  Duration get _lPos => Platform.isIOS ? _ios.position : _player.position;
+  ProcessingState get _lProc =>
+      Platform.isIOS ? _ios.state : _player.processingState;
+  Duration get _lBuffered => Platform.isIOS
+      ? (_ios.duration ?? _ios.position)
+      : _player.bufferedPosition;
+  double get _lSpeed => Platform.isIOS ? 1.0 : _player.speed;
+  Future<void> _lStop() => Platform.isIOS ? _ios.stop() : _player.stop();
+  Future<void> _lPause() => Platform.isIOS ? _ios.pause() : _player.pause();
+  Future<void> _lPlay() => Platform.isIOS ? _ios.play() : _player.play();
+  Future<void> _lSeek(Duration d) =>
+      Platform.isIOS ? _ios.seek(d) : _player.seek(d);
+
+  void _onLocalCompleted() {
+    if (!_local) return;
+    if (playerOpts.consumeSleepAtEnd()) {
+      // Sleep timer: stop after this song.
+      _lPause();
+      return;
+    }
+    (localEnded ?? localNext)?.call();
+  }
+
   WebAudioHandler() {
-    _player.playbackEventStream.listen((_) {
-      if (_local) _broadcastLocal();
-    }, onError: (_) {});
-    _player.processingStateStream.listen((s) {
-      if (!_local || s != ProcessingState.completed) return;
-      if (playerOpts.consumeSleepAtEnd()) {
-        // Sleep timer: stop after this song.
-        _player.pause();
-        return;
-      }
-      (localEnded ?? localNext)?.call();
-    });
+    if (Platform.isIOS) {
+      _ios.changes.listen((_) {
+        if (_local) _broadcastLocal();
+      });
+      _ios.processingStates.listen((s) {
+        if (s == ProcessingState.completed) _onLocalCompleted();
+      });
+    } else {
+      _player.playbackEventStream.listen((_) {
+        if (_local) _broadcastLocal();
+      }, onError: (_) {});
+      _player.processingStateStream.listen((s) {
+        if (s == ProcessingState.completed) _onLocalCompleted();
+      });
+    }
   }
 
   // Personalize sound for songs streaming from the website: the site's own
@@ -503,7 +643,7 @@ class WebAudioHandler extends BaseAudioHandler {
   if (window.__webEq) return;
   var FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   var ctx = null, filters = [], failed = false;
-  var bassF, clarF, presF, side, wet, boost, limiter;
+  var bassF, clarF, presF, side, wet, boost, limiter, probe;
   var lastStatus = '';
   var hookError = '';
   function report(extra) {
@@ -559,6 +699,8 @@ class WebAudioHandler extends BaseAudioHandler {
       var AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) { failed = true; return false; }
       ctx = new AC();
+      probe = ctx.createAnalyser();  // only listens: shows if sound reaches the chain
+      probe.fftSize = 512;
       // 10-band equaliser
       for (var i = 0; i < FREQS.length; i++) {
         var f = biquad(i === 0 ? 'lowshelf' : (i === FREQS.length - 1 ? 'highshelf' : 'peaking'),
@@ -611,6 +753,7 @@ class WebAudioHandler extends BaseAudioHandler {
     try {
       var src = ctx.createMediaElementSource(v);
       src.connect(filters[0]);
+      src.connect(probe);
       v.__eqHooked = true;
     } catch (e) { v.__eqHooked = true; hookError = String(e && e.message || e); }
   }
@@ -648,6 +791,15 @@ class WebAudioHandler extends BaseAudioHandler {
     if (ctx) { hook(); resumeCtx(); }
     else if (wanted()) apply();
   }, true);
+  function level() {
+    if (!probe) return -1;
+    try {
+      var a = new Uint8Array(probe.fftSize), m = 0;
+      probe.getByteTimeDomainData(a);
+      for (var i = 0; i < a.length; i++) { var d = Math.abs(a[i] - 128); if (d > m) m = d; }
+      return m;  // 0 = silence reaches the chain, up to 128 = loud
+    } catch (e) { return -2; }
+  }
   window.__webEqDiag = function () {
     var v = document.querySelector('video, audio');
     var src = '';
@@ -663,6 +815,8 @@ class WebAudioHandler extends BaseAudioHandler {
       element: v ? v.tagName : 'none',
       elementHooked: v ? !!v.__eqHooked : false,
       playing: v ? !v.paused : false,
+      signal: level(),
+      muted: v ? v.muted : null,
       srcKind: src.split(':')[0] + (/m3u8/.test(src) ? ' (HLS)' : ''),
       wanted: wanted(),
       config: window.__webEqCfg || null
@@ -711,7 +865,8 @@ class WebAudioHandler extends BaseAudioHandler {
       artUri: artPath == null ? null : Uri.file(artPath),
     );
     mediaItem.add(item);
-    final d = await _player.setFilePath(path);
+    final Duration? d =
+        Platform.isIOS ? await _ios.load(path) : await _player.setFilePath(path);
     eqReady = true;
     // Before the song starts, so it never plays flat for a moment first.
     await applyEq().timeout(const Duration(seconds: 2), onTimeout: () {});
@@ -719,9 +874,9 @@ class WebAudioHandler extends BaseAudioHandler {
     if (startAt != null &&
         startAt > Duration.zero &&
         (d == null || startAt < d)) {
-      await _player.seek(startAt);
+      await _lSeek(startAt);
     }
-    _player.play(); // not awaited: it only finishes when the song ends
+    _lPlay(); // not awaited: on Android it only finishes when the song ends
   }
 
   /// Sends the Personalize sound settings to the player's equaliser. The
@@ -729,6 +884,27 @@ class WebAudioHandler extends BaseAudioHandler {
   Future<void> applyEq() async {
     pushWebEq(); // songs streaming from the website
     if (!eqReady) return;
+    if (Platform.isIOS) {
+      // Songs on the phone: the native player has the whole chain.
+      try {
+        await _ios.applyFx({
+          'on': eqState.enabled,
+          'gains': eqState.gains,
+          'boost': eqState.boostDb,
+          'wide': eqState.fxWide,
+          'bass': eqState.fxBass,
+          'clarity': eqState.fxClarity,
+          'room': eqState.fxRoom,
+        });
+        eqWorks = true;
+        boostWorks = true;
+        fxNative = {'virtualizer': true, 'bass': true, 'reverb': true};
+      } catch (_) {
+        eqWorks = false;
+      }
+      eqState.refresh();
+      return;
+    }
     try {
       final useEq = eqState.enabled || eqState.fxClarity > 0;
       await equalizer.setEnabled(useEq);
@@ -773,7 +949,7 @@ class WebAudioHandler extends BaseAudioHandler {
     if (!_local) return;
     _local = false;
     _lastKey = '';
-    await _player.stop();
+    await _lStop();
     // Nothing is playing any more: clear it so the mini player hides.
     mediaItem.add(null);
     playbackState.add(playbackState.value.copyWith(
@@ -789,12 +965,12 @@ class WebAudioHandler extends BaseAudioHandler {
     if (!_local) return;
     _local = false;
     _lastKey = '';
-    await _player.stop();
+    await _lStop();
     playbackState.add(playbackState.value.copyWith(playing: false));
   }
 
   void _broadcastLocal() {
-    final playing = _player.playing;
+    final playing = _lPlaying;
     playbackState.add(PlaybackState(
       controls: [
         MediaControl.skipToPrevious,
@@ -809,22 +985,22 @@ class WebAudioHandler extends BaseAudioHandler {
         ProcessingState.buffering: AudioProcessingState.buffering,
         ProcessingState.ready: AudioProcessingState.ready,
         ProcessingState.completed: AudioProcessingState.completed,
-      }[_player.processingState]!,
+      }[_lProc]!,
       playing: playing,
-      updatePosition: _player.position,
-      bufferedPosition: _player.bufferedPosition,
-      speed: _player.speed,
+      updatePosition: _lPos,
+      bufferedPosition: _lBuffered,
+      speed: _lSpeed,
     ));
   }
 
   // ---- Buttons (notification / lock screen) --------------------------------
   @override
   Future<void> play() => _local
-      ? _player.play()
+      ? _lPlay()
       : _js("var v=document.querySelector('video');if(v){v.play();}");
 
   @override
-  Future<void> pause() => _local ? _player.pause() : _js(_pauseWebJs);
+  Future<void> pause() => _local ? _lPause() : _js(_pauseWebJs);
 
   @override
   Future<void> skipToNext() async {
@@ -848,7 +1024,7 @@ class WebAudioHandler extends BaseAudioHandler {
 
   @override
   Future<void> seek(Duration position) => _local
-      ? _player.seek(position)
+      ? _lSeek(position)
       : _js(
           "var v=document.querySelector('video');if(v){v.currentTime=${position.inMilliseconds / 1000};}");
 
@@ -873,7 +1049,7 @@ class WebAudioHandler extends BaseAudioHandler {
       // started a song there, then hand playback back to the website.
       if (d['playing'] != true) return;
       _local = false;
-      _player.stop();
+      _lStop();
       _lastKey = '';
       localStopped?.call();
     }
@@ -1284,11 +1460,50 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList('local_songs') ?? [];
     final list = <LocalSong>[];
+    // iPhone: the app's folder can get a new address after an update or a
+    // re-install from Xcode, so a saved full path stops working. If the file
+    // is gone from the saved place but is in today's music folder, use that.
+    String? musicDir;
+    try {
+      musicDir = '${(await getApplicationDocumentsDirectory()).path}/music';
+    } catch (_) {}
+    String fixPath(String old) {
+      if (old.isEmpty || File(old).existsSync() || musicDir == null) return old;
+      final moved = '$musicDir/${old.split('/').last}';
+      return File(moved).existsSync() ? moved : old;
+    }
+
+    var rebased = false;
     for (final s in raw) {
       try {
-        final song = LocalSong.fromJson(jsonDecode(s) as Map<String, dynamic>);
+        var song = LocalSong.fromJson(jsonDecode(s) as Map<String, dynamic>);
+        final p = fixPath(song.path);
+        if (p != song.path) {
+          rebased = true;
+          song = LocalSong(
+              title: song.title,
+              artist: song.artist,
+              path: p,
+              art: fixPath(song.art),
+              uploaded: song.uploaded);
+        } else if (song.art.isNotEmpty) {
+          final a = fixPath(song.art);
+          if (a != song.art) {
+            rebased = true;
+            song = LocalSong(
+                title: song.title,
+                artist: song.artist,
+                path: song.path,
+                art: a,
+                uploaded: song.uploaded);
+          }
+        }
         if (File(song.path).existsSync()) list.add(song);
       } catch (_) {}
+    }
+    if (rebased) {
+      await prefs.setStringList(
+          'local_songs', list.map((x) => jsonEncode(x.toJson())).toList());
     }
     final played = <String, int>{};
     try {
@@ -1332,7 +1547,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (e is! File) continue;
         final path = e.path;
         final lp = path.toLowerCase();
-        if (!(lp.endsWith('.mp3') || lp.endsWith('.m4a')) ||
+        if (!_audioExts.any((x) => lp.endsWith('.$x')) ||
             known.contains(path)) {
           continue;
         }
@@ -1358,7 +1573,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (title.isEmpty) {
           title = vid.isNotEmpty
               ? 'Song $vid'
-              : name.replaceAll(RegExp(r'\.(mp3|m4a)$', caseSensitive: false), '');
+              : name.replaceAll(
+                  RegExp(r'\.(mp3|m4a|aac|wav|aiff?|caf|flac)$',
+                      caseSensitive: false),
+                  '');
         }
         found.add(LocalSong(
             title: title, artist: artist, path: path, art: artPath));
@@ -1378,26 +1596,113 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         'local_songs', _localSongs.map((s) => jsonEncode(s.toJson())).toList());
   }
 
+  // Audio the phone can play. (iPhone cannot play .ogg / .opus / .wma.)
+  static const List<String> _audioExts = [
+    'mp3', 'm4a', 'aac', 'wav', 'aif', 'aiff', 'caf', 'flac',
+  ];
+
+  // iPhone: FileType.audio opens the Apple Music library (not the Files app)
+  // and returns converted copies, so MP3s kept in Files cannot be chosen and
+  // the copies may have no usable name. The Files picker is used instead.
+  Future<List<PlatformFile>> _pickAudio() {
+    if (Platform.isIOS) {
+      return FilePicker.pickFiles(
+          type: FileType.custom, allowedExtensions: _audioExts);
+    }
+    return FilePicker.pickFiles(type: FileType.audio);
+  }
+
+  // What the file really is, from its first bytes (null = not recognised).
+  // iPhone's player decides by the file name's ending, so a file with a wrong
+  // or missing ending fails with "could not play".
+  Future<String?> _sniffAudioExt(File f) async {
+    try {
+      final raf = await f.open();
+      final b = await raf.read(16);
+      await raf.close();
+      if (b.length < 4) return null;
+      String at(int i, int n) =>
+          String.fromCharCodes(b.skip(i).take(n).toList());
+      if (at(0, 3) == 'ID3') return 'mp3';
+      if (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) {
+        // MPEG audio frame: layer bits 00 are invalid; ADTS AAC has them as 00
+        return ((b[1] >> 1) & 0x03) == 0 ? 'aac' : 'mp3';
+      }
+      if (b.length >= 8 && at(4, 4) == 'ftyp') return 'm4a';
+      if (at(0, 4) == 'fLaC') return 'flac';
+      if (b.length >= 12 && at(0, 4) == 'RIFF' && at(8, 4) == 'WAVE') return 'wav';
+      if (b.length >= 12 && at(0, 4) == 'FORM') return 'aiff';
+      if (at(0, 4) == 'caff') return 'caf';
+      if (at(0, 4) == 'OggS') return 'ogg';
+    } catch (_) {}
+    return null;
+  }
+
+  // Copies a picked file into [destBase].<ext> (the right ending is chosen by
+  // looking inside the file). Returns the new path, or null if the file is
+  // empty or a kind this phone cannot play.
+  Future<String?> _savePickedAudio(PlatformFile f, String destBase) async {
+    final tmp = File('$destBase.part');
+    try {
+      final from = f.path;
+      var copied = false;
+      if (from != null) {
+        try {
+          await File(from).copy(tmp.path);
+          copied = true;
+        } catch (_) {}
+      }
+      if (!copied) await tmp.writeAsBytes(await f.readAsBytes());
+      if (await tmp.length() == 0) {
+        await tmp.delete();
+        return null;
+      }
+      final sniffed = await _sniffAudioExt(tmp);
+      final named = f.name.contains('.')
+          ? f.name.substring(f.name.lastIndexOf('.') + 1).toLowerCase()
+          : '';
+      var ext = sniffed ?? (_audioExts.contains(named) ? named : '');
+      if (ext == 'aiff' && named == 'aif') ext = 'aif';
+      if (ext.isEmpty && !Platform.isIOS) ext = 'mp3';
+      if (ext.isEmpty || (Platform.isIOS && !_audioExts.contains(ext))) {
+        await tmp.delete();
+        return null;
+      }
+      final dest = '$destBase.$ext';
+      await tmp.rename(dest);
+      return dest;
+    } catch (_) {
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+      return null;
+    }
+  }
+
   // Lets the person pick audio files, copies them into the app's own storage,
   // and reads the title / artist / cover art from the file's tags.
   Future<void> _addMusic() async {
     // file_picker 13: pickFiles() returns a plain list (empty if cancelled).
-    final files = await FilePicker.pickFiles(type: FileType.audio);
+    final files = await _pickAudio();
     if (files.isEmpty) return;
     final docs = await getApplicationDocumentsDirectory();
     final dir = Directory('${docs.path}/music');
     await dir.create(recursive: true);
     var added = 0;
+    var skipped = 0;
     for (final f in files) {
       try {
         final name = f.name;
-        final dest =
-            '${dir.path}/${DateTime.now().microsecondsSinceEpoch}_$name';
-        // Copy the picked file's bytes (works without needing a file path).
-        await File(dest).writeAsBytes(await f.readAsBytes());
         var title = name.contains('.')
             ? name.substring(0, name.lastIndexOf('.'))
             : name;
+        final stem = title.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_');
+        final dest = await _savePickedAudio(
+            f, '${dir.path}/${DateTime.now().microsecondsSinceEpoch}_$stem');
+        if (dest == null) {
+          skipped++;
+          continue;
+        }
         var artist = '';
         var artPath = '';
         try {
@@ -1420,7 +1725,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {});
     await _persistLocal();
-    _toast(added > 0 ? 'Added $added song(s)' : 'Could not add those files');
+    _toast(added > 0
+        ? 'Added $added song(s)${skipped > 0 ? ' ($skipped skipped: empty or not a format this phone plays)' : ''}'
+        : 'Could not add those files (empty, or not MP3 / M4A / WAV / FLAC / AAC)');
   }
 
   void _markPlayed(LocalSong s) {
@@ -1703,8 +2010,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         startAt: start,
       );
       return true;
-    } catch (_) {
-      _toast('Could not play this file');
+    } catch (e) {
+      var why = _errText(e).replaceAll('\n', ' ');
+      if (why.length > 110) why = '${why.substring(0, 110)}...';
+      _toast('Could not play this file ($why)');
       return false;
     }
   }
@@ -2246,10 +2555,94 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
+  // The "who am I" string YouTube expects for a stream link. A link made for
+  // one YouTube app is refused (HTTP 403) when it is fetched with another
+  // app's identity, so it is read from the link's own "c=" part.
+  static const String _uaIos =
+      'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+  static const String _uaSafari =
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+
+  String _uaForLink(Uri url) {
+    final c = (url.queryParameters['c'] ?? '').toUpperCase();
+    if (c == 'IOS') return _uaIos;
+    if (c == 'ANDROID_VR') {
+      return 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+    }
+    if (c == 'ANDROID') {
+      return 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip';
+    }
+    return _uaSafari;
+  }
+
+  // Asks YouTube's iPhone app endpoint for the audio links directly. Used only
+  // when the library's own links are refused. Returns (url, bytes) or null.
+  Future<({Uri url, int size})?> _iosAppAudioLink(String vid, int wantBytes,
+      {required bool smallest, required bool middle}) async {
+    final res = await http
+        .post(
+          Uri.parse(
+              'https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false'),
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': _uaIos,
+            'X-YouTube-Client-Name': '5',
+            'X-YouTube-Client-Version': '20.10.4',
+          },
+          body: jsonEncode({
+            'context': {
+              'client': {
+                'clientName': 'IOS',
+                'clientVersion': '20.10.4',
+                'deviceMake': 'Apple',
+                'deviceModel': 'iPhone16,2',
+                'osName': 'iPhone',
+                'osVersion': '18.3.2.22D82',
+                'hl': 'en',
+                'gl': 'US',
+                'userAgent': _uaIos,
+              },
+            },
+            'videoId': vid,
+            'contentCheckOk': true,
+            'racyCheckOk': true,
+          }),
+        )
+        .timeout(const Duration(seconds: 25));
+    if (res.statusCode != 200) return null;
+    final data = jsonDecode(utf8.decode(res.bodyBytes));
+    final formats = (data is Map ? data['streamingData'] : null) is Map
+        ? (data['streamingData']['adaptiveFormats'] as List? ?? const [])
+        : const [];
+    final audio = <Map<String, dynamic>>[];
+    for (final f in formats) {
+      if (f is! Map) continue;
+      final mime = '${f['mimeType'] ?? ''}';
+      if (!mime.startsWith('audio/mp4')) continue;
+      if (f['url'] is! String || f['contentLength'] == null) continue;
+      audio.add(Map<String, dynamic>.from(f));
+    }
+    if (audio.isEmpty) return null;
+    audio.sort((a, b) =>
+        ((a['bitrate'] as num?) ?? 0).compareTo((b['bitrate'] as num?) ?? 0));
+    Map<String, dynamic> pick = smallest
+        ? audio.first
+        : (middle ? audio[audio.length ~/ 2] : audio.last);
+    for (final f in audio) {
+      // the very same stream as the library found, so a half-done file can go on
+      if (int.tryParse('${f['contentLength']}') == wantBytes) pick = f;
+    }
+    final size = int.tryParse('${pick['contentLength']}') ?? 0;
+    if (size <= 0) return null;
+    return (url: Uri.parse(pick['url'] as String), size: size);
+  }
+
   // iPhone download: asks YouTube for the audio-only stream (AAC / .m4a, which
   // the iPhone can play) and saves it. No yt-dlp and no ffmpeg needed.
-  // If the stream gives no data for 20 s it is dropped and the file is fetched
-  // in small pieces instead; Stop works at any moment.
+  // Three ways, each carrying on from what is already saved:
+  //   1) the library's own stream (stops after 12 s without data),
+  //   2) small pieces with the right app identity, retried and re-linked,
+  //   3) the links from YouTube's iPhone app endpoint.
   Future<String> _downloadWithDart(
       String vid, String id, Directory dir, DownloadTask task) async {
     final yt = yt_explode.YoutubeExplode();
@@ -2265,6 +2658,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       if (cancelled) throw Exception('Cancelled');
     }
 
+    final out = File('${dir.path}/$id.m4a');
+    IOSink? sink;
     try {
       _dl.log('Asking YouTube for the audio streams...');
       final manifest = await yt.videos.streamsClient
@@ -2281,7 +2676,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       final info = _quality == 'small'
           ? aac.first
           : (_quality == 'medium' ? aac[aac.length ~/ 2] : aac.last);
-      final total = info.size.totalBytes;
+      var total = info.size.totalBytes;
+      var link = info.url;
       _dl.log(
           'Downloading ${(info.bitrate.kiloBitsPerSecond).round()} kbps AAC (${(total / 1048576).toStringAsFixed(1)} MB)');
       task.status = DlStatus.downloading;
@@ -2292,6 +2688,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       final clock = Stopwatch()..start();
       void progress() {
         task.received = got;
+        task.total = total;
         if (total > 0) task.pct = got * 100 / total;
         final secs = clock.elapsedMilliseconds / 1000;
         if (secs > 0.5) task.speedKBs = got / 1024 / secs;
@@ -2303,8 +2700,18 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _dl.changed();
       }
 
-      // 1) the library's own stream, with a 20 s "no data" watchdog
-      Future<void> viaLibrary(IOSink sink) async {
+      // Starts the file again from byte 0 (used when the stream changes).
+      Future<void> restart() async {
+        await sink?.close();
+        sink = out.openWrite();
+        got = 0;
+        step = -1;
+      }
+
+      sink = out.openWrite();
+
+      // 1) the library's own stream, with a "no data" watchdog
+      Future<void> viaLibrary() async {
         final done = Completer<void>();
         var lastData = DateTime.now();
         Timer? idle;
@@ -2321,7 +2728,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
         sub = yt.videos.streamsClient.get(info).listen((chunk) {
           lastData = DateTime.now();
-          sink.add(chunk);
+          sink!.add(chunk);
           got += chunk.length;
           progress();
         }, onError: (Object e) => finish(e), onDone: () => finish(),
@@ -2331,10 +2738,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           finish(Exception('Cancelled'));
         };
         hooks.add(hook);
-        idle = Timer.periodic(const Duration(seconds: 3), (_) {
-          if (DateTime.now().difference(lastData).inSeconds >= 20) {
+        idle = Timer.periodic(const Duration(seconds: 2), (_) {
+          if (DateTime.now().difference(lastData).inSeconds >= 12) {
             sub?.cancel();
-            finish(TimeoutException('no data for 20 seconds'));
+            finish(TimeoutException('no data for 12 seconds'));
           }
         });
         try {
@@ -2347,36 +2754,79 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         }
       }
 
-      // 2) small pieces, each its own request (works when the stream stalls)
-      Future<void> viaPieces(IOSink sink) async {
+      // 2 + 3) small pieces. Each piece is tried up to 4 times: Range header,
+      // then "&range=" in the link (how the YouTube site asks), then again
+      // after getting a fresh link.
+      Future<void> viaPieces(Uri start, String ua, {required bool refresh}) async {
         final client = http.Client();
         final hook = () => client.close();
         hooks.add(hook);
+        var url = start;
+        final web = ua == _uaSafari;
         try {
-          const piece = 512 * 1024;
+          const piece = 1024 * 1024;
           while (got < total) {
             check();
             final end = math.min(got + piece, total) - 1;
-            final res = await client.get(info.url, headers: {
-              'Range': 'bytes=$got-$end',
-              'User-Agent':
-                  'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
-            }).timeout(const Duration(seconds: 20));
-            check();
-            if (res.statusCode != 200 && res.statusCode != 206) {
-              throw Exception(
-                  'YouTube refused the download (HTTP ${res.statusCode})');
+            Object? lastErr;
+            http.Response? ok;
+            for (var attempt = 0; attempt < 4 && ok == null; attempt++) {
+              check();
+              if (attempt == 2 && refresh) {
+                try {
+                  final fresh = await yt.videos.streamsClient
+                      .getManifest(vid)
+                      .timeout(const Duration(seconds: 30));
+                  for (final s in fresh.audioOnly) {
+                    if (s.container == yt_explode.StreamContainer.mp4 &&
+                        s.size.totalBytes == total) {
+                      url = s.url;
+                      ua = _uaForLink(url);
+                      break;
+                    }
+                  }
+                } catch (_) {}
+              }
+              final asQuery = attempt.isOdd;
+              final target =
+                  asQuery ? Uri.parse('$url&range=$got-$end') : url;
+              try {
+                final res = await client.get(target, headers: {
+                  'User-Agent': ua,
+                  'Accept': '*/*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  if (!asQuery) 'Range': 'bytes=$got-$end',
+                  if (web) 'Origin': 'https://music.youtube.com',
+                  if (web) 'Referer': 'https://music.youtube.com/',
+                }).timeout(const Duration(seconds: 25));
+                check();
+                if ((res.statusCode == 200 || res.statusCode == 206) &&
+                    res.bodyBytes.isNotEmpty) {
+                  if (res.statusCode == 200 && got > 0 && !asQuery) {
+                    lastErr = 'YouTube ignored the range request';
+                  } else {
+                    ok = res;
+                  }
+                } else {
+                  lastErr = 'HTTP ${res.statusCode}';
+                }
+              } on TimeoutException {
+                lastErr = 'timeout';
+              } catch (e) {
+                check();
+                lastErr = e;
+              }
+              if (ok == null) {
+                await Future<void>.delayed(const Duration(milliseconds: 400));
+              }
             }
-            if (res.bodyBytes.isEmpty) {
-              throw Exception('YouTube sent no data');
+            if (ok == null) {
+              throw Exception('YouTube refused the download ($lastErr)');
             }
-            if (res.statusCode == 200 && got > 0) {
-              throw Exception('YouTube ignored the range request');
-            }
-            sink.add(res.bodyBytes);
-            got += res.bodyBytes.length;
+            sink!.add(ok.bodyBytes);
+            got += ok.bodyBytes.length;
             progress();
-            if (res.statusCode == 200) break; // whole file in one go
+            if (ok.statusCode == 200 && ok.bodyBytes.length >= total) break;
           }
         } finally {
           hooks.remove(hook);
@@ -2384,25 +2834,53 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         }
       }
 
-      final out = File('${dir.path}/$id.m4a');
-      final sink = out.openWrite();
+      Object? failure;
       try {
+        await viaLibrary();
+      } catch (e) {
+        check();
+        _dl.log('Direct stream failed ($e). Trying small pieces...');
+      }
+      if (got < total) {
         try {
-          await viaLibrary(sink);
+          await viaPieces(link, _uaForLink(link), refresh: true);
         } catch (e) {
           check();
-          _dl.log('Direct stream failed ($e). Trying small pieces...');
+          failure = e;
+          _dl.log('Small pieces failed ($e). Trying the iPhone app link...');
         }
-        if (got < total) await viaPieces(sink);
-      } finally {
-        await sink.close();
       }
+      if (got < total) {
+        try {
+          final alt = await _iosAppAudioLink(vid, total,
+              smallest: _quality == 'small', middle: _quality == 'medium');
+          check();
+          if (alt == null) throw Exception('no audio link from the iPhone app endpoint');
+          if (alt.size != total) {
+            total = alt.size;
+            await restart();
+          }
+          link = alt.url;
+          await viaPieces(link, _uaIos, refresh: false);
+          failure = null;
+        } catch (e) {
+          check();
+          _dl.log('iPhone app link failed ($e)');
+          failure ??= e;
+        }
+      }
+      await sink?.close();
+      sink = null;
       check();
       if (got < total) {
-        throw Exception('Download ended early ($got of $total bytes)');
+        final f = failure;
+        throw f is Exception ? f : Exception(f ?? 'Download ended early ($got of $total bytes)');
       }
       return out.path;
     } finally {
+      try {
+        await sink?.close();
+      } catch (_) {}
       _dartCancels.remove(id);
       yt.close();
     }
@@ -3272,7 +3750,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _toast('Already on this device');
       return;
     }
-    final files = await FilePicker.pickFiles(type: FileType.audio);
+    final files = await _pickAudio();
     if (files.isEmpty) return;
     _uploadBusy = true;
     try {
@@ -3281,9 +3759,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       final dir = Directory('${docs.path}/music');
       await dir.create(recursive: true);
       final tag = s.vid.length == 11 ? s.vid : 'saved';
-      final dest =
-          '${dir.path}/${DateTime.now().microsecondsSinceEpoch}_$tag.${_extOf(f.name)}';
-      await File(dest).writeAsBytes(await f.readAsBytes());
+      final dest = await _savePickedAudio(
+          f, '${dir.path}/${DateTime.now().microsecondsSinceEpoch}_$tag');
+      if (dest == null) throw Exception('Not a file this phone can play');
       var artPath = '';
       final artUrl = s.art.startsWith('http')
           ? s.art
@@ -3352,7 +3830,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       ),
     );
     if (go != true) return;
-    final files = await FilePicker.pickFiles(type: FileType.audio);
+    final files = await _pickAudio();
     if (files.isEmpty) return;
     _uploadBusy = true;
     try {
@@ -6608,7 +7086,7 @@ class PersonalizeSoundPage extends StatelessWidget {
                           ),
                           child: Text(
                               Platform.isIOS
-                                  ? 'On iPhone the equalizer works on streaming songs only. Songs added from your files are not changed yet.'
+                                  ? 'The equalizer for songs on this iPhone could not start. Play a downloaded song once, then try again.'
                                   : 'This phone did not accept the equalizer, so the sound cannot be changed here.',
                               style: TextStyle(fontSize: 12)),
                         ),
