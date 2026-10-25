@@ -3,34 +3,42 @@ name: iOS-ipa-build
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
 jobs:
   build-ios:
     name: 🎉 iOS Build
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          architecture: x64
+          cache: true
+
       - run: flutter pub get
-      
 
-      - run: pod repo update
-        working-directory: ios
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
 
-      - run: flutter build ios --release --no-codesign
+      - run: flutter build ios --release --no-codesign --no-pub
 
-      - run: mkdir Payload
+      - name: Make IPA
         working-directory: build/ios/iphoneos
-
-      - run: mv Runner.app/ Payload
-        working-directory: build/ios/iphoneos
-
-      - name: Zip output
-        run: zip -qq -r -9 FlutterIpaExport.ipa Payload
-        working-directory: build/ios/iphoneos
+        run: |
+          mkdir Payload
+          mv Runner.app Payload/
+          zip -qq -r -9 FlutterIpaExport.ipa Payload
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
