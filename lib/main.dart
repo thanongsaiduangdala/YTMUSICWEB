@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt_explode;
 
 late final WebAudioHandler audioHandler;
 
@@ -509,7 +510,7 @@ class WebAudioHandler extends BaseAudioHandler {
     else if (!ctx) st = wanted() ? 'starting' : 'idle';
     else if (hookError) st = 'hook-failed: ' + hookError;
     else st = ctx.state;
-    var v = document.querySelector('video');
+    var v = document.querySelector('video, audio');
     st += v ? (v.__eqHooked ? ' | video hooked' : ' | video not hooked yet') : ' | no video';
     if (extra) st += ' | ' + extra;
     if (st === lastStatus) return;
@@ -603,7 +604,7 @@ class WebAudioHandler extends BaseAudioHandler {
     } catch (e) { failed = true; ctx = null; hookError = String(e && e.message || e); return false; }
   }
   function hook() {
-    var v = document.querySelector('video');
+    var v = document.querySelector('video, audio');
     if (!v || v.__eqHooked || !ensureChain()) return;
     try {
       var src = ctx.createMediaElementSource(v);
@@ -1204,7 +1205,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   }
 
   Future<void> _smartKick() async {
-    if (Platform.isIOS) return; // no yt-dlp on iPhone
     if (_smartBusy) return;
     _smartBusy = true;
     try {
@@ -1309,7 +1309,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       await for (final e in dir.list()) {
         if (e is! File) continue;
         final path = e.path;
-        if (!path.toLowerCase().endsWith('.mp3') || known.contains(path)) {
+        final lp = path.toLowerCase();
+        if (!(lp.endsWith('.mp3') || lp.endsWith('.m4a')) ||
+            known.contains(path)) {
           continue;
         }
         if (await e.length() == 0) continue;
@@ -1334,7 +1336,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (title.isEmpty) {
           title = vid.isNotEmpty
               ? 'Song $vid'
-              : name.replaceAll(RegExp(r'\.mp3$', caseSensitive: false), '');
+              : name.replaceAll(RegExp(r'\.(mp3|m4a)$', caseSensitive: false), '');
         }
         found.add(LocalSong(
             title: title, artist: artist, path: path, art: artPath));
@@ -2137,11 +2139,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (idle >= 10) _dl.log('No output for ${idle}s, still working...');
       });
 
-      if (Platform.isIOS) {
-        throw Exception(
-            'Downloading from YouTube is not available on iPhone yet. You can add your own music files instead.');
-      }
-      outPath = await _ytdlp.invokeMethod<String>('download', {
+      // iPhone cannot run yt-dlp, so the audio is fetched in Dart instead.
+      outPath = Platform.isIOS
+          ? await _downloadWithDart(vid, id, dir, task)
+          : await _ytdlp.invokeMethod<String>('download', {
         'url': 'https://music.youtube.com/watch?v=$vid',
         'dir': dir.path,
         'id': id,
@@ -2210,6 +2211,61 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _dl.changed();
     }
     return task;
+  }
+
+  // iPhone download: asks YouTube for the audio-only stream (AAC / .m4a, which
+  // the iPhone can play) and saves it. No yt-dlp and no ffmpeg needed.
+  Future<String> _downloadWithDart(
+      String vid, String id, Directory dir, DownloadTask task) async {
+    final yt = yt_explode.YoutubeExplode();
+    try {
+      _dl.log('Asking YouTube for the audio streams...');
+      final manifest = await yt.videos.streamsClient
+          .getManifest(vid)
+          .timeout(const Duration(seconds: 60));
+      final aac = manifest.audioOnly
+          .where((s) => s.container == yt_explode.StreamContainer.mp4)
+          .toList()
+        ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+      if (aac.isEmpty) {
+        throw Exception('YouTube gave no audio stream the iPhone can play');
+      }
+      final info = _quality == 'small'
+          ? aac.first
+          : (_quality == 'medium' ? aac[aac.length ~/ 2] : aac.last);
+      final total = info.size.totalBytes;
+      _dl.log(
+          'Downloading ${(info.bitrate.kiloBitsPerSecond).round()} kbps AAC (${(total / 1048576).toStringAsFixed(1)} MB)');
+      task.status = DlStatus.downloading;
+      task.total = total;
+      _dl.changed();
+
+      final out = File('${dir.path}/$id.m4a');
+      final sink = out.openWrite();
+      var got = 0, step = -1;
+      final clock = Stopwatch()..start();
+      try {
+        await for (final chunk in yt.videos.streamsClient.get(info)) {
+          sink.add(chunk);
+          got += chunk.length;
+          task.received = got;
+          if (total > 0) task.pct = got * 100 / total;
+          final secs = clock.elapsedMilliseconds / 1000;
+          if (secs > 0.5) task.speedKBs = got / 1024 / secs;
+          final st = total > 0 ? (got * 10 ~/ total) : 0;
+          if (st > step) {
+            step = st;
+            _dl.log('Downloaded ${st * 10}%');
+          }
+          _dl.changed();
+        }
+      } finally {
+        await sink.close();
+      }
+      return out.path;
+    } finally {
+      yt.close();
+    }
   }
 
   String _errText(Object e) =>
@@ -2872,7 +2928,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (e is! File) continue;
         final name = e.path.split('/').last;
         if (!name.startsWith('$id.')) continue;
-        if (name == '$id.mp3' || name == '$id.mp3.jpg') continue;
+        if (name == '$id.mp3' ||
+            name == '$id.mp3.jpg' ||
+            name == '$id.m4a' ||
+            name == '$id.m4a.jpg') {
+          continue;
+        }
         try {
           await e.delete();
         } catch (_) {}
