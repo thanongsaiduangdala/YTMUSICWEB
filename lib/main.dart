@@ -457,6 +457,8 @@ class WebAudioHandler extends BaseAudioHandler {
   bool? boostWorks;
   static const MethodChannel _fx = MethodChannel('ytmusicweb/fx');
   Map<String, dynamic> fxNative = {};
+  /// What the effects script inside the website says about itself.
+  String webEqStatus = '';
   bool _local = false;
 
   /// Set by the page: next / previous song in the on-device list.
@@ -499,6 +501,28 @@ class WebAudioHandler extends BaseAudioHandler {
   var FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   var ctx = null, filters = [], failed = false;
   var bassF, clarF, presF, side, wet, boost, limiter;
+  var lastStatus = '';
+  var hookError = '';
+  function report(extra) {
+    var st;
+    if (failed) st = 'unsupported';
+    else if (!ctx) st = wanted() ? 'starting' : 'idle';
+    else if (hookError) st = 'hook-failed: ' + hookError;
+    else st = ctx.state;
+    var v = document.querySelector('video');
+    st += v ? (v.__eqHooked ? ' | video hooked' : ' | video not hooked yet') : ' | no video';
+    if (extra) st += ' | ' + extra;
+    if (st === lastStatus) return;
+    lastStatus = st;
+    try { if (window.EqStatus) EqStatus.postMessage(st); } catch (e) {}
+  }
+  function resumeCtx() {
+    if (!ctx || ctx.state === 'running') return;
+    try {
+      var r = ctx.resume();
+      if (r && r.then) r.then(function () { report(); }, function () { report('resume refused'); });
+    } catch (e) {}
+  }
 
   function cfg() {
     return window.__webEqCfg || { on: false, gains: [], boost: 0, fx: {} };
@@ -576,7 +600,7 @@ class WebAudioHandler extends BaseAudioHandler {
       boost.connect(limiter);
       limiter.connect(ctx.destination);
       return true;
-    } catch (e) { failed = true; ctx = null; return false; }
+    } catch (e) { failed = true; ctx = null; hookError = String(e && e.message || e); return false; }
   }
   function hook() {
     var v = document.querySelector('video');
@@ -585,7 +609,7 @@ class WebAudioHandler extends BaseAudioHandler {
       var src = ctx.createMediaElementSource(v);
       src.connect(filters[0]);
       v.__eqHooked = true;
-    } catch (e) { v.__eqHooked = true; }
+    } catch (e) { v.__eqHooked = true; hookError = String(e && e.message || e); }
   }
   function apply() {
     if (!ctx && !wanted()) return;
@@ -602,15 +626,23 @@ class WebAudioHandler extends BaseAudioHandler {
     wet.gain.value = (fx.room || 0) * 0.45;
     boost.gain.value = Math.pow(10, Math.max(0, c.boost || 0) / 20);
     hook();
-    if (ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} }
+    resumeCtx();
+    report();
   }
   setInterval(function () {
-    if (!ctx) { if (wanted()) apply(); return; }
+    if (!ctx) { if (wanted()) apply(); report(); return; }
     hook();
-    if (ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} }
+    resumeCtx();
+    report();
   }, 1500);
+  // iPhone only starts audio effects after a touch on the page.
+  ['touchstart', 'touchend', 'click', 'pointerup'].forEach(function (t) {
+    document.addEventListener(t, function () {
+      if (!ctx && wanted()) apply(); else resumeCtx();
+    }, true);
+  });
   document.addEventListener('play', function () {
-    if (ctx) { hook(); if (ctx.state === 'suspended') { try { ctx.resume(); } catch (e) {} } }
+    if (ctx) { hook(); resumeCtx(); }
     else if (wanted()) apply();
   }, true);
   window.__webEq = { apply: apply };
@@ -3168,36 +3200,113 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   if (window.__adBlockInstalled) return;
   window.__adBlockInstalled = true;
 
+  // 1) Hide banners and "Try Premium" pop-ups.
   const style = document.createElement('style');
   style.textContent = `
     ytmusic-mealbar-promo-renderer,
     ytmusic-statement-banner-renderer,
-    .ytp-ad-module, .ytp-ad-overlay-container,
+    ytmusic-upsell-dialog-renderer,
+    .ytp-ad-module, .ytp-ad-overlay-container, .ytp-ad-player-overlay,
     #player-ads, .video-ads { display: none !important; }
   `;
   document.head.appendChild(style);
 
-  function handleAd() {
-    const player = document.querySelector('#movie_player, ytmusic-player');
-    const adShowing = player && player.classList.contains('ad-showing');
-    const video = document.querySelector('video');
-
-    const skip = document.querySelector(
-      '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
-    if (skip) skip.click();
-
-    if (adShowing && video && isFinite(video.duration)) {
-      video.muted = true;
-      video.playbackRate = 16;
-      video.currentTime = video.duration;
+  // 2) Remove the ad data from the site's answers before the player sees it.
+  //    The site asks for every song with fetch; ads come inside that answer.
+  const strip = (o, depth) => {
+    if (!o || typeof o !== 'object' || (depth || 0) > 6) return;
+    if (o.adPlacements) o.adPlacements = [];
+    if (o.playerAds) o.playerAds = [];
+    if (o.adSlots) o.adSlots = [];
+    if (o.adBreakHeartbeatParams) delete o.adBreakHeartbeatParams;
+    for (const k in o) {
+      const v = o[k];
+      if (v && typeof v === 'object') strip(v, (depth || 0) + 1);
     }
+  };
+  try {
+    const origParse = JSON.parse;
+    JSON.parse = function (t, r) {
+      const v = origParse.call(this, t, r);
+      try {
+        if (v && typeof v === 'object' &&
+            (v.adPlacements || v.playerAds || v.adSlots)) strip(v, 0);
+      } catch (e) {}
+      return v;
+    };
+  } catch (e) {}
+  try {
+    const origFetch = window.fetch;
+    window.fetch = async function () {
+      const res = await origFetch.apply(this, arguments);
+      try {
+        const a0 = arguments[0];
+        const url = typeof a0 === 'string' ? a0 : ((a0 && a0.url) || '');
+        if (/\/youtubei\/v1\/(player|next)/.test(url)) {
+          const text = await res.clone().text();
+          if (/adPlacements|playerAds|adSlots/.test(text)) {
+            const j = JSON.parse(text);
+            strip(j, 0);
+            return new Response(JSON.stringify(j), {
+              status: res.status,
+              statusText: res.statusText,
+              headers: res.headers,
+            });
+          }
+        }
+      } catch (e) {}
+      return res;
+    };
+  } catch (e) {}
+
+  // 3) If an ad still gets through: skip it, speed it up and mute it, then
+  //    put the sound back to normal for the song.
+  let inAd = false;
+  function adShowing() {
+    const player = document.querySelector('#movie_player, ytmusic-player');
+    if (player && (player.classList.contains('ad-showing') ||
+                   player.classList.contains('ad-interrupting'))) return true;
+    return !!document.querySelector(
+        '.ytp-ad-player-overlay, .ytp-ad-text, .ytp-ad-preview-container');
+  }
+  function handleAd() {
+    try {
+      const video = document.querySelector('video');
+      const dialog = document.querySelector('ytmusic-upsell-dialog-renderer');
+      if (dialog) {
+        const close = dialog.querySelector(
+            '#dismiss-button, .dismiss-button, button[aria-label="Close"], button[aria-label="No thanks"]');
+        if (close) close.click();
+      }
+      const skip = document.querySelector(
+          '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-container button');
+      if (skip) skip.click();
+
+      if (adShowing()) {
+        inAd = true;
+        if (video) {
+          video.muted = true;
+          video.playbackRate = 16;
+          if (isFinite(video.duration) && video.duration > 0) {
+            video.currentTime = video.duration;
+          }
+        }
+      } else if (inAd) {
+        inAd = false;
+        if (video) {
+          video.muted = false;
+          video.playbackRate = 1;
+        }
+      }
+    } catch (e) {}
   }
 
   new MutationObserver(handleAd).observe(document.body,
       { childList: true, subtree: true, attributes: true });
-  setInterval(handleAd, 500);
+  setInterval(handleAd, 400);
 })();
 ''';
+
 
   // Background playback: the site pauses itself when it thinks the page is hidden.
   // This makes the page always report "visible" and ignores visibility/blur events.
@@ -3452,6 +3561,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       })
       ..addJavaScriptChannel('ShadowPlay',
           onMessageReceived: (msg) => _onShadowPlay(msg.message))
+      ..addJavaScriptChannel('EqStatus', onMessageReceived: (msg) {
+        audioHandler.webEqStatus = msg.message;
+        eqState.refresh();
+      })
       ..addJavaScriptChannel('PageUrl', onMessageReceived: (msg) {
         // A playlist page looks like music.youtube.com/playlist?list=...
         String? link;
@@ -6246,6 +6359,13 @@ class PersonalizeSoundPage extends StatelessWidget {
                       const Text(
                           'Works on downloaded songs and on songs streaming from YouTube Music. For a streaming song, the change may take a second to be heard.',
                           style: TextStyle(fontSize: 12, color: Colors.white54)),
+                      if (audioHandler.webEqStatus.isNotEmpty &&
+                          (eqState.enabled || eqState.fxOn || eqState.boostDb > 0)) ...[
+                        const SizedBox(height: 8),
+                        Text('Streaming effects: ${audioHandler.webEqStatus}',
+                            style: const TextStyle(
+                                fontSize: 11, color: Colors.white38)),
+                      ],
                       if (audioHandler.eqWorks == false) ...[
                         const SizedBox(height: 10),
                         Container(
