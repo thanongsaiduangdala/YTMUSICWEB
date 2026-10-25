@@ -441,6 +441,8 @@ final EqSettings eqState = EqSettings();
 class WebAudioHandler extends BaseAudioHandler {
   /// Set by the page: runs JavaScript inside the webview.
   Future<void> Function(String js)? runJs;
+  /// Runs JavaScript in the website and returns what it answers.
+  Future<Object> Function(String js)? runJsResult;
   String _lastKey = '';
 
   Future<void> _js(String code) async => runJs?.call(code);
@@ -646,6 +648,26 @@ class WebAudioHandler extends BaseAudioHandler {
     if (ctx) { hook(); resumeCtx(); }
     else if (wanted()) apply();
   }, true);
+  window.__webEqDiag = function () {
+    var v = document.querySelector('video, audio');
+    var src = '';
+    try { src = v ? (v.currentSrc || v.src || '') : ''; } catch (e) {}
+    return JSON.stringify({
+      scriptInstalled: true,
+      audioContext: !!(window.AudioContext || window.webkitAudioContext),
+      mediaSourceApi: !!window.MediaSource,
+      managedMediaSource: !!window.ManagedMediaSource,
+      ctxState: ctx ? ctx.state : 'not created',
+      chainFailed: failed,
+      hookError: hookError,
+      element: v ? v.tagName : 'none',
+      elementHooked: v ? !!v.__eqHooked : false,
+      playing: v ? !v.paused : false,
+      srcKind: src.split(':')[0] + (/m3u8/.test(src) ? ' (HLS)' : ''),
+      wanted: wanted(),
+      config: window.__webEqCfg || null
+    });
+  };
   window.__webEq = { apply: apply };
   apply();
 })();
@@ -2320,7 +2342,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         } finally {
           idle?.cancel();
           hooks.remove(hook);
-          await sub?.cancel();
+          // Not awaited: a stuck stream never finishes closing.
+          sub?.cancel();
         }
       }
 
@@ -3776,6 +3799,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1');
     }
     audioHandler.runJs = (js) => _controller.runJavaScript(js);
+    audioHandler.runJsResult = (js) => _controller.runJavaScriptReturningResult(js);
     audioHandler.localNext = () async {
       if (_shadowVid != null || _resumeVid != null) {
         await _webStep(true);
@@ -6326,6 +6350,33 @@ class PersonalizeSoundPage extends StatelessWidget {
     );
   }
 
+  // Asks the website's script how it is doing and shows the answer, so we can
+  // see why the streaming effects do or do not work.
+  Future<void> _checkWebEq(BuildContext context) async {
+    String text;
+    try {
+      final r = await (audioHandler.runJsResult
+              ?.call('window.__webEqDiag ? window.__webEqDiag() : "script not installed in the page"') ??
+          Future.value('no web view yet'))
+          .timeout(const Duration(seconds: 8));
+      text = r.toString();
+    } catch (e) {
+      text = 'Could not ask the page: $e';
+    }
+    if (!context.mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Streaming effects check'),
+        content: SingleChildScrollView(child: SelectableText(text)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+        ],
+      ),
+    );
+  }
+
   Widget _fxSlider(String label, double v, ValueChanged<double> on) {
     return Row(
       children: [
@@ -6537,12 +6588,16 @@ class PersonalizeSoundPage extends StatelessWidget {
                       const Text(
                           'Works on downloaded songs and on songs streaming from YouTube Music. For a streaming song, the change may take a second to be heard.',
                           style: TextStyle(fontSize: 12, color: Colors.white54)),
-                      if (audioHandler.webEqStatus.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text('Streaming effects: ${audioHandler.webEqStatus}',
-                            style: const TextStyle(
-                                fontSize: 11, color: Colors.white38)),
-                      ],
+                      const SizedBox(height: 8),
+                      Text(
+                          'Streaming effects: ${audioHandler.webEqStatus.isEmpty ? 'no report from the page yet' : audioHandler.webEqStatus}',
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.lightBlueAccent)),
+                      TextButton.icon(
+                        onPressed: () => _checkWebEq(context),
+                        icon: const Icon(Icons.bug_report_outlined, size: 18),
+                        label: const Text('Check streaming effects'),
+                      ),
                       if (audioHandler.eqWorks == false) ...[
                         const SizedBox(height: 10),
                         Container(
