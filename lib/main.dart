@@ -2129,7 +2129,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
       task.status = DlStatus.preparing;
       _dl.changed();
-      _dl.log(_ytdlpChecked
+      _dl.log(Platform.isIOS
+          ? 'Starting download...'
+          : _ytdlpChecked
           ? 'Starting yt-dlp...'
           : 'Starting yt-dlp (the first run unpacks it and checks for an update, this can take a minute)...');
 
@@ -2149,7 +2151,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         'update': !_ytdlpChecked,
         'quality': _qualityArg,
       }).timeout(const Duration(minutes: 10), onTimeout: () {
-        _ytdlp.invokeMethod('cancel', {'id': id});
+        _cancelDownload(id);
         throw TimeoutException('Gave up after 10 minutes');
       });
       watchdog.cancel();
@@ -2213,16 +2215,40 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return task;
   }
 
+  // Stops a running download (yt-dlp on Android, the Dart download on iPhone).
+  final Map<String, VoidCallback> _dartCancels = {};
+  void _cancelDownload(String id) {
+    _dartCancels[id]?.call();
+    if (!Platform.isIOS) {
+      _ytdlp.invokeMethod('cancel', {'id': id}).catchError((_) {});
+    }
+  }
+
   // iPhone download: asks YouTube for the audio-only stream (AAC / .m4a, which
   // the iPhone can play) and saves it. No yt-dlp and no ffmpeg needed.
+  // If the stream gives no data for 20 s it is dropped and the file is fetched
+  // in small pieces instead; Stop works at any moment.
   Future<String> _downloadWithDart(
       String vid, String id, Directory dir, DownloadTask task) async {
     final yt = yt_explode.YoutubeExplode();
+    var cancelled = false;
+    final hooks = <VoidCallback>[];
+    _dartCancels[id] = () {
+      cancelled = true;
+      for (final h in List.of(hooks)) {
+        h();
+      }
+    };
+    void check() {
+      if (cancelled) throw Exception('Cancelled');
+    }
+
     try {
       _dl.log('Asking YouTube for the audio streams...');
       final manifest = await yt.videos.streamsClient
           .getManifest(vid)
           .timeout(const Duration(seconds: 60));
+      check();
       final aac = manifest.audioOnly
           .where((s) => s.container == yt_explode.StreamContainer.mp4)
           .toList()
@@ -2240,30 +2266,121 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       task.total = total;
       _dl.changed();
 
-      final out = File('${dir.path}/$id.m4a');
-      final sink = out.openWrite();
       var got = 0, step = -1;
       final clock = Stopwatch()..start();
-      try {
-        await for (final chunk in yt.videos.streamsClient.get(info)) {
+      void progress() {
+        task.received = got;
+        if (total > 0) task.pct = got * 100 / total;
+        final secs = clock.elapsedMilliseconds / 1000;
+        if (secs > 0.5) task.speedKBs = got / 1024 / secs;
+        final st = total > 0 ? (got * 10 ~/ total) : 0;
+        if (st > step) {
+          step = st;
+          _dl.log('Downloaded ${st * 10}%');
+        }
+        _dl.changed();
+      }
+
+      // 1) the library's own stream, with a 20 s "no data" watchdog
+      Future<void> viaLibrary(IOSink sink) async {
+        final done = Completer<void>();
+        var lastData = DateTime.now();
+        Timer? idle;
+        StreamSubscription<List<int>>? sub;
+        void finish([Object? err]) {
+          idle?.cancel();
+          if (done.isCompleted) return;
+          if (err == null) {
+            done.complete();
+          } else {
+            done.completeError(err);
+          }
+        }
+
+        sub = yt.videos.streamsClient.get(info).listen((chunk) {
+          lastData = DateTime.now();
           sink.add(chunk);
           got += chunk.length;
-          task.received = got;
-          if (total > 0) task.pct = got * 100 / total;
-          final secs = clock.elapsedMilliseconds / 1000;
-          if (secs > 0.5) task.speedKBs = got / 1024 / secs;
-          final st = total > 0 ? (got * 10 ~/ total) : 0;
-          if (st > step) {
-            step = st;
-            _dl.log('Downloaded ${st * 10}%');
+          progress();
+        }, onError: (Object e) => finish(e), onDone: () => finish(),
+            cancelOnError: true);
+        final hook = () {
+          sub?.cancel();
+          finish(Exception('Cancelled'));
+        };
+        hooks.add(hook);
+        idle = Timer.periodic(const Duration(seconds: 3), (_) {
+          if (DateTime.now().difference(lastData).inSeconds >= 20) {
+            sub?.cancel();
+            finish(TimeoutException('no data for 20 seconds'));
           }
-          _dl.changed();
+        });
+        try {
+          await done.future;
+        } finally {
+          idle?.cancel();
+          hooks.remove(hook);
+          await sub?.cancel();
         }
+      }
+
+      // 2) small pieces, each its own request (works when the stream stalls)
+      Future<void> viaPieces(IOSink sink) async {
+        final client = http.Client();
+        final hook = () => client.close();
+        hooks.add(hook);
+        try {
+          const piece = 512 * 1024;
+          while (got < total) {
+            check();
+            final end = math.min(got + piece, total) - 1;
+            final res = await client.get(info.url, headers: {
+              'Range': 'bytes=$got-$end',
+              'User-Agent':
+                  'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+            }).timeout(const Duration(seconds: 20));
+            check();
+            if (res.statusCode != 200 && res.statusCode != 206) {
+              throw Exception(
+                  'YouTube refused the download (HTTP ${res.statusCode})');
+            }
+            if (res.bodyBytes.isEmpty) {
+              throw Exception('YouTube sent no data');
+            }
+            if (res.statusCode == 200 && got > 0) {
+              throw Exception('YouTube ignored the range request');
+            }
+            sink.add(res.bodyBytes);
+            got += res.bodyBytes.length;
+            progress();
+            if (res.statusCode == 200) break; // whole file in one go
+          }
+        } finally {
+          hooks.remove(hook);
+          client.close();
+        }
+      }
+
+      final out = File('${dir.path}/$id.m4a');
+      final sink = out.openWrite();
+      try {
+        try {
+          await viaLibrary(sink);
+        } catch (e) {
+          check();
+          _dl.log('Direct stream failed ($e). Trying small pieces...');
+        }
+        if (got < total) await viaPieces(sink);
       } finally {
         await sink.close();
       }
+      check();
+      if (got < total) {
+        throw Exception('Download ended early ($got of $total bytes)');
+      }
       return out.path;
     } finally {
+      _dartCancels.remove(id);
       yt.close();
     }
   }
@@ -2565,7 +2682,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _skipCurrent = true;
     _dl.log('Cancelling "${s.title}"...');
     final id = _activeId;
-    if (id != null) _ytdlp.invokeMethod('cancel', {'id': id});
+    if (id != null) _cancelDownload(id);
   }
 
   // Adds songs to the end of the list and starts the worker if it is idle.
@@ -2968,7 +3085,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _dl.pending.clear();
     _dl.log('Stopping (you tapped Stop)...');
     final id = _activeId;
-    if (id != null) _ytdlp.invokeMethod('cancel', {'id': id});
+    if (id != null) _cancelDownload(id);
     if (!_queueRunning) {
       // paused: nothing is running that could clean up
       _batchCancel = false;
@@ -6420,8 +6537,7 @@ class PersonalizeSoundPage extends StatelessWidget {
                       const Text(
                           'Works on downloaded songs and on songs streaming from YouTube Music. For a streaming song, the change may take a second to be heard.',
                           style: TextStyle(fontSize: 12, color: Colors.white54)),
-                      if (audioHandler.webEqStatus.isNotEmpty &&
-                          (eqState.enabled || eqState.fxOn || eqState.boostDb > 0)) ...[
+                      if (audioHandler.webEqStatus.isNotEmpty) ...[
                         const SizedBox(height: 8),
                         Text('Streaming effects: ${audioHandler.webEqStatus}',
                             style: const TextStyle(
