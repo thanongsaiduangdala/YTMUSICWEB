@@ -14,3 +14,6 @@
    - Saved paths are repaired if the app folder address changed.
    - The error toast now shows the real reason.
 4. Streaming effects check now shows `signal` (0 = no sound reaches the effects chain).
+5. Download via the YouTube page's own link
+   - lib/main.dart: the page is hooked (`gvHookJs`) to note the audio link it uses; the download tries that link first
+     (only for the song currently playing). New button "Check download link" under the equalizer shows what the page used.

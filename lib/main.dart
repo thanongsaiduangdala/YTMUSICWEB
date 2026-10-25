@@ -634,6 +634,69 @@ class WebAudioHandler extends BaseAudioHandler {
     }
   }
 
+  // Download helper: notes the audio links the YouTube Music page itself uses
+  // for the song that is playing (the page already has YouTube's tokens).
+  static const gvHookJs = r'''
+(function () {
+  if (window.__gv) return;
+  var log = [];
+  window.__gv = { log: log, audio: null };
+  function curVid() {
+    try {
+      var pl = document.getElementById('movie_player');
+      return pl && pl.getVideoData ? (pl.getVideoData().video_id || '') : '';
+    } catch (e) { return ''; }
+  }
+  function note(kind, method, url, bodyLen) {
+    try {
+      if (!/googlevideo\.com\/videoplayback/.test(url)) return;
+      var u = new URL(url, location.href), p = u.searchParams;
+      var mime = p.get('mime') || '';
+      log.push({ kind: kind, method: method, host: u.host, mime: mime,
+                 itag: p.get('itag'), pot: p.has('pot'), sabr: p.has('sabr'),
+                 range: p.get('range'), clen: p.get('clen'), bodyLen: bodyLen || 0 });
+      if (log.length > 30) log.shift();
+      if (mime.indexOf('audio') === 0 && String(method).toUpperCase() === 'GET' && !p.has('sabr')) {
+        window.__gv.audio = { url: u.href, mime: mime, itag: p.get('itag'),
+                              clen: p.get('clen'), vid: curVid() };
+      }
+    } catch (e) {}
+  }
+  var of = window.fetch;
+  if (of) {
+    window.fetch = function (input, init) {
+      try {
+        var url = typeof input === 'string' ? input : (input && input.url);
+        var m = (init && init.method) || (input && input.method) || 'GET';
+        var b = init && init.body && (init.body.byteLength || init.body.length || init.body.size);
+        note('fetch', m, String(url), b);
+      } catch (e) {}
+      return of.apply(this, arguments);
+    };
+  }
+  var ox = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (m, u) {
+    this.__gm = m; this.__gu = u;
+    return ox.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function (b) {
+    try { note('xhr', this.__gm, String(this.__gu), b && (b.byteLength || b.length || b.size)); } catch (e) {}
+    return os.apply(this, arguments);
+  };
+  window.__gvDiag = function () {
+    var a = window.__gv.audio;
+    return JSON.stringify({
+      hookInstalled: true,
+      playingVideo: curVid(),
+      audioLinkCaptured: !!a,
+      audio: a ? { itag: a.itag, mime: a.mime, bytes: a.clen, video: a.vid,
+                   hasPot: /[?&]pot=/.test(a.url) } : null,
+      lastRequests: log.slice(-8)
+    });
+  };
+})();
+''';
+
   // Personalize sound for songs streaming from the website: the site's own
   // <video> is routed through a Web Audio chain (10 filters + booster + a
   // limiter). It is only built the first time the equaliser or the booster is
@@ -2575,6 +2638,32 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return _uaSafari;
   }
 
+  // The audio link the YouTube Music page itself is using for the song that is
+  // playing right now (it already carries YouTube's tokens). Null if the page
+  // has not used a plain link for this song, or it is not an AAC / MP4 stream.
+  Future<({Uri url, int size})?> _pageAudioLink(String vid) async {
+    try {
+      final run = audioHandler.runJsResult;
+      if (run == null) return null;
+      var t = (await run('JSON.stringify(window.__gv && window.__gv.audio || null)')
+              .timeout(const Duration(seconds: 6)))
+          .toString();
+      if (t.startsWith('"')) t = jsonDecode(t) as String;
+      final d = jsonDecode(t);
+      if (d is! Map) return null;
+      if ('${d['vid']}' != vid) return null;
+      if (!'${d['mime']}'.contains('mp4')) return null;
+      final size = int.tryParse('${d['clen']}') ?? 0;
+      if (size <= 0) return null;
+      // drop the page's own range / pacing parts; pieces add their own range
+      final clean = '${d['url']}'.replaceAll(RegExp(r'[&?](range|rn|rbuf)=[^&]*'), '');
+      final fixed = clean.contains('?') ? clean : clean.replaceFirst('&', '?');
+      return (url: Uri.parse(fixed), size: size);
+    } catch (_) {
+      return null;
+    }
+  }
+
   // Asks YouTube's iPhone app endpoint for the audio links directly. Used only
   // when the library's own links are refused. Returns (url, bytes) or null.
   Future<({Uri url, int size})?> _iosAppAudioLink(String vid, int wantBytes,
@@ -2835,8 +2924,27 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       }
 
       Object? failure;
+      // 0) the link the YouTube page itself is using for this song
+      final page = await _pageAudioLink(vid);
+      if (page != null) {
+        _dl.log('Using the audio link from the YouTube page...');
+        final keepTotal = total;
+        total = page.size;
+        try {
+          await viaPieces(page.url, _uaSafari, refresh: false);
+        } catch (e) {
+          check();
+          _dl.log('Page link failed ($e)');
+        }
+        if (got < total) {
+          total = keepTotal;
+          await restart();
+        }
+      } else {
+        _dl.log('No usable link from the YouTube page for this song');
+      }
       try {
-        await viaLibrary();
+        if (got < total) await viaLibrary();
       } catch (e) {
         check();
         _dl.log('Direct stream failed ($e). Trying small pieces...');
@@ -4257,11 +4365,15 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (mounted && link != _playlistUrl) setState(() => _playlistUrl = link);
       })
       ..setNavigationDelegate(NavigationDelegate(
-        onPageStarted: (_) => _controller.runJavaScript(_keepAliveJs),
+        onPageStarted: (_) {
+          _controller.runJavaScript(_keepAliveJs);
+          _controller.runJavaScript(WebAudioHandler.gvHookJs);
+        },
         onPageFinished: (_) {
           _controller.runJavaScript(_keepAliveJs);
           _controller.runJavaScript(_adBlockJs);
           _controller.runJavaScript(WebAudioHandler.webEqJs);
+          _controller.runJavaScript(WebAudioHandler.gvHookJs);
           audioHandler.pushWebEq();
           _controller.runJavaScript(_shadowJs);
           _controller.runJavaScript(_nowPlayingJs);
@@ -6830,6 +6942,31 @@ class PersonalizeSoundPage extends StatelessWidget {
 
   // Asks the website's script how it is doing and shows the answer, so we can
   // see why the streaming effects do or do not work.
+  Future<void> _checkDownloadLink(BuildContext context) async {
+    String text;
+    try {
+      final r = await (audioHandler.runJsResult?.call(
+                  'window.__gvDiag ? window.__gvDiag() : "hook not installed in the page"') ??
+              Future.value('no web view yet'))
+          .timeout(const Duration(seconds: 8));
+      text = r.toString();
+    } catch (e) {
+      text = 'Could not ask the page: $e';
+    }
+    if (!context.mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Download link check'),
+        content: SingleChildScrollView(child: SelectableText(text)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+        ],
+      ),
+    );
+  }
+
   Future<void> _checkWebEq(BuildContext context) async {
     String text;
     try {
@@ -7075,6 +7212,11 @@ class PersonalizeSoundPage extends StatelessWidget {
                         onPressed: () => _checkWebEq(context),
                         icon: const Icon(Icons.bug_report_outlined, size: 18),
                         label: const Text('Check streaming effects'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _checkDownloadLink(context),
+                        icon: const Icon(Icons.link, size: 18),
+                        label: const Text('Check download link'),
                       ),
                       if (audioHandler.eqWorks == false) ...[
                         const SizedBox(height: 10),
