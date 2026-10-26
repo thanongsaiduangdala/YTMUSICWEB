@@ -4322,10 +4322,14 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   void _failDownload(DownloadTask task, String message, {bool toast = true}) {
     task.status = DlStatus.failed;
     task.error = message;
+    final ex = explainDownloadError(message);
+    task.why = ex.why;
+    task.fixes = ex.fixes;
+    task.offerReset = ex.reset;
     task.finishedAt = DateTime.now();
     _dl.log('FAILED: $message', error: true);
     if (mounted && toast) {
-      _toast('Download failed. See Download tab > Downloading for details.');
+      _toast('Download failed: ${ex.why} See Download tab > Downloading for fixes.');
     }
   }
 
@@ -5185,6 +5189,103 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 enum DlStatus { preparing, downloading, saving, done, failed }
 
 /// One download, with everything the Downloading screen shows about it.
+/// Turns a download error into a reason in plain words and ways to fix it.
+({String why, List<String> fixes, bool reset}) explainDownloadError(String raw) {
+  final e = raw.toLowerCase();
+  bool has(List<String> words) => words.any(e.contains);
+  if (has(['new streaming mode'])) {
+    return (
+      why:
+          'YouTube is giving this session its newer streaming mode, which the app cannot download from.',
+      fixes: [
+        'Sound tab > Reset page session (it signs you out). Wait for the page to load, play a song, then download again.',
+        'Or sign in to YouTube Music (with or without Premium), play a song, then download.',
+        'Last resort: delete the app and install it again.',
+      ],
+      reset: true,
+    );
+  }
+  if (has(['could not get this song', 'could not get a link', 'no usable link'])) {
+    return (
+      why: 'The app could not get this song\'s audio link from the YouTube page.',
+      fixes: [
+        'Play the song in the Music tab for 10 to 20 seconds (let any ad finish), then tap download.',
+        'After opening the app, wait for the page to finish loading first.',
+        'Check your internet. If a VPN is on, try turning it off or picking another server.',
+        'Sound tab > Reset page session, then try again.',
+      ],
+      reset: true,
+    );
+  }
+  if (has(['http 403', 'refused the download'])) {
+    return (
+      why: 'YouTube refused to send the audio.',
+      fixes: [
+        'Play the song in the Music tab first, then download it while it is playing.',
+        'Sign in to YouTube Music, then try again.',
+        'Sound tab > Reset page session, then try again.',
+        'Turn the VPN off or on, or pick another server.',
+      ],
+      reset: true,
+    );
+  }
+  if (has(['unplayable', 'not available', 'private video', 'age-restricted', 'age restricted', 'sign in to confirm'])) {
+    return (
+      why:
+          'This song cannot be played right now (removed, private, age-restricted, or blocked in your country).',
+      fixes: [
+        'Try another version of the song (a different upload).',
+        'Try a VPN set to another country.',
+        'If it is age-restricted, sign in to YouTube Music.',
+      ],
+      reset: false,
+    );
+  }
+  if (has(['timeout', 'socket', 'connection', 'clientexception', 'host lookup', 'network'])) {
+    return (
+      why: 'The connection to YouTube dropped or was too slow.',
+      fixes: [
+        'Check your Wi-Fi or mobile data, then try again.',
+        'If a VPN is on, turn it off or pick another server.',
+        'Move closer to the router, or try again in a minute.',
+      ],
+      reset: false,
+    );
+  }
+  if (has(['no space', 'filesystem', 'disk'])) {
+    return (
+      why: 'There is not enough free storage on this iPhone.',
+      fixes: [
+        'Free some space in iPhone Settings > General > iPhone Storage.',
+        'Delete songs you no longer need (Storage page in this app).',
+      ],
+      reset: false,
+    );
+  }
+  if (has(['cancelled', 'canceled'])) {
+    return (why: 'You cancelled this download.', fixes: const [], reset: false);
+  }
+  if (has(['no mp3 file', 'not a file this phone can play', 'no audio'])) {
+    return (
+      why: 'The audio was fetched but is empty or not in a format this phone can play.',
+      fixes: [
+        'Try downloading the song again.',
+        'Try another version of the song.',
+      ],
+      reset: false,
+    );
+  }
+  return (
+    why: 'Something unexpected went wrong.',
+    fixes: [
+      'Try the download again.',
+      'Play the song in the Music tab first, then download it.',
+      'Use Copy in the Log below and send it to the developer.',
+    ],
+    reset: false,
+  );
+}
+
 class DownloadTask {
   final int id;
   final String title, artist;
@@ -5195,6 +5296,10 @@ class DownloadTask {
   double? pct; // 0..100 from yt-dlp
   int? etaSec;
   String? error;
+  // Plain-words reason and ways to fix it (set when the download fails).
+  String? why;
+  List<String> fixes = const [];
+  bool offerReset = false; // show the "Reset page session" button
   final DateTime startedAt = DateTime.now();
   DateTime? finishedAt;
 
@@ -5570,8 +5675,59 @@ class DownloadingPage extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 6),
-            Text(detail,
-                style: const TextStyle(fontSize: 12, color: Colors.white54)),
+            if (failed && t.why != null) ...[
+              Text(t.why!,
+                  style: const TextStyle(fontSize: 14, color: Colors.white)),
+              if (t.fixes.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                const Text('How to fix it:',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white70)),
+                for (final f in t.fixes)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('•  ',
+                            style: TextStyle(color: Colors.white70)),
+                        Expanded(
+                            child: Text(f,
+                                style: const TextStyle(
+                                    fontSize: 13, color: Colors.white70))),
+                      ],
+                    ),
+                  ),
+              ],
+              if (t.offerReset)
+                Builder(
+                  builder: (ctx) => TextButton.icon(
+                    onPressed: () async {
+                      String msg;
+                      try {
+                        await audioHandler.resetPageSession?.call();
+                        msg =
+                            'Done. Wait for the page to load, play a song, then download.';
+                      } catch (e) {
+                        msg = 'Could not reset: $e';
+                      }
+                      if (ctx.mounted) {
+                        ScaffoldMessenger.of(ctx)
+                            .showSnackBar(SnackBar(content: Text(msg)));
+                      }
+                    },
+                    icon: const Icon(Icons.restart_alt, size: 18),
+                    label: const Text('Reset page session (signs you out)'),
+                  ),
+                ),
+              const SizedBox(height: 6),
+              Text('Technical details: $detail',
+                  style: const TextStyle(fontSize: 11, color: Colors.white38)),
+            ] else
+              Text(detail,
+                  style: const TextStyle(fontSize: 12, color: Colors.white54)),
           ],
         ),
       ),

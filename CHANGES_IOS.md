@@ -32,3 +32,5 @@
     reloads the page once, and if it persists stops with a clear message instead of trying the routes that always return 403.
 12. New button Sound tab > "Reset page session (signs you out)": clears the web page's cookies / storage / cache and reloads it
     (like a fresh install, without touching downloaded songs). The SABR error message points to it.
+13. Failed downloads now say why in plain words and list ways to fix it (explainDownloadError in lib/main.dart), shown on the
+    failed card in Download tab > Downloading, with a "Reset page session" button when it can help. The raw error stays as "Technical details".
