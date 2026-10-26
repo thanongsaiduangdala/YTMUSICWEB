@@ -3682,7 +3682,47 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   }
 
   // Asks yt-dlp for the list of songs in a playlist / channel page link.
+  // iPhone has no yt-dlp, so the playlist is read with the youtube_explode
+  // library (the same one the iPhone download uses).
+  Future<_PlaylistData> _readPlaylistDart(String url) async {
+    final yt = yt_explode.YoutubeExplode();
+    try {
+      final id = Uri.tryParse(url)?.queryParameters['list'] ?? url;
+      var title = '';
+      try {
+        final p = await yt.playlists.get(id).timeout(const Duration(seconds: 30));
+        title = p.title.trim();
+      } catch (e) {
+        _dl.log('Could not read the playlist name ($e)');
+      }
+      final songs = <Map<String, String>>[];
+      final seen = <String>{};
+      var unavailable = 0;
+      await for (final v
+          in yt.playlists.getVideos(id).timeout(const Duration(seconds: 60))) {
+        final vid = v.id.value;
+        final t = v.title.trim();
+        if (vid.length != 11 ||
+            t.isEmpty ||
+            t == '[Private video]' ||
+            t == '[Deleted video]') {
+          unavailable++;
+          continue;
+        }
+        if (!seen.add(vid)) continue;
+        songs.add({'id': vid, 'title': t, 'artist': v.author});
+      }
+      if (unavailable > 0) {
+        _dl.log('Skipping $unavailable private or deleted entries');
+      }
+      return _PlaylistData(id, title, songs);
+    } finally {
+      yt.close();
+    }
+  }
+
   Future<_PlaylistData> _readPlaylist(String url) async {
+    if (Platform.isIOS) return _readPlaylistDart(url);
     final raw = await _ytdlp
         .invokeMethod<String>('list', {'url': url})
         .timeout(const Duration(seconds: 120));
