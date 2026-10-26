@@ -3693,6 +3693,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       } catch (e) {
         _dl.log('Could not read the playlist name ($e)');
       }
+      // YouTube Music request first: youtube_explode's playlist parser returns
+      // 0 songs with YouTube's current format.
+      songs = await _readPlaylistBrowse(id);
+      _dl.log('YouTube Music request found ${songs.length} songs');
+      if (songs.isNotEmpty) return _PlaylistData(id, title, songs);
       try {
         final seen = <String>{};
         var unavailable = 0;
@@ -3720,10 +3725,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       yt.close();
     }
     _dl.log('youtube_explode found ${songs.length} songs');
-    if (songs.isEmpty) {
-      songs = await _readPlaylistBrowse(id);
-      _dl.log('Direct YouTube request found ${songs.length} songs');
-    }
     return _PlaylistData(id, title, songs);
   }
 
@@ -3738,13 +3739,16 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return '';
   }
 
+  // Reads a public / unlisted playlist through the YouTube Music (WEB_REMIX)
+  // client. No login needed. Undocumented API: update the version when it
+  // stops working.
   Future<List<Map<String, String>>> _readPlaylistBrowse(String id) async {
     final songs = <Map<String, String>>[];
     final seen = <String>{};
-    const version = '2.20250925.01.00';
+    const version = '1.20250929.03.00';
     final context = <String, dynamic>{
       'client': {
-        'clientName': 'WEB',
+        'clientName': 'WEB_REMIX',
         'clientVersion': version,
         'hl': 'en',
         'gl': 'US',
@@ -3753,16 +3757,14 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     Future<dynamic> post(Map<String, dynamic> body) async {
       final res = await http
           .post(
-            Uri.parse('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false'),
+            Uri.parse(
+                'https://music.youtube.com/youtubei/v1/browse?prettyPrint=false'),
             headers: {
               'Content-Type': 'application/json',
-              'Origin': 'https://www.youtube.com',
-              'User-Agent':
-                  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
-              'X-YouTube-Client-Name': '1',
+              'X-YouTube-Client-Name': '67',
               'X-YouTube-Client-Version': version,
             },
-            body: jsonEncode(body),
+            body: jsonEncode({'context': context, ...body}),
           )
           .timeout(const Duration(seconds: 30));
       if (res.statusCode != 200) {
@@ -3772,7 +3774,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       return jsonDecode(utf8.decode(res.bodyBytes));
     }
 
-    String? token;
+    final tokens = <String>[];
     void walk(dynamic n) {
       if (n is List) {
         for (final e in n) {
@@ -3781,29 +3783,35 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         return;
       }
       if (n is! Map) return;
-      final r = n['playlistVideoRenderer'];
-      if (r is Map) {
-        final vid = r['videoId'];
-        final t = _runsText(r['title']);
-        if (vid is String &&
-            vid.length == 11 &&
-            t.isNotEmpty &&
-            t != '[Private video]' &&
-            t != '[Deleted video]' &&
-            seen.add(vid)) {
-          songs.add({
-            'id': vid,
-            'title': t,
-            'artist': _runsText(r['shortBylineText']),
-          });
+      final item = n['musicResponsiveListItemRenderer'];
+      if (item is Map) {
+        final vid = item['playlistItemData']?['videoId'];
+        final cols = item['flexColumns'];
+        if (vid is String && vid.length == 11 && cols is List && cols.isNotEmpty) {
+          String col(int i) {
+            if (i >= cols.length || cols[i] is! Map) return '';
+            return _runsText(
+                cols[i]['musicResponsiveListItemFlexColumnRenderer']?['text']);
+          }
+
+          final t = col(0);
+          if (t.isNotEmpty &&
+              t != '[Private video]' &&
+              t != '[Deleted video]' &&
+              seen.add(vid)) {
+            songs.add({'id': vid, 'title': t, 'artist': col(1)});
+          }
         }
-        return;
       }
+      // Next page token: newer and older response formats.
       final c = n['continuationItemRenderer'];
       if (c is Map) {
         final t = c['continuationEndpoint']?['continuationCommand']?['token'];
-        if (t is String) token = t;
-        return;
+        if (t is String) tokens.add(t);
+      }
+      final nx = n['nextContinuationData'];
+      if (nx is Map && nx['continuation'] is String) {
+        tokens.add(nx['continuation'] as String);
       }
       for (final v in n.values) {
         walk(v);
@@ -3811,17 +3819,20 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
 
     try {
-      var data = await post({'context': context, 'browseId': 'VL$id'});
+      var data = await post({'browseId': 'VL$id'});
+      final used = <String>{};
       var pages = 0;
       while (data != null && pages < 200) {
-        token = null;
+        tokens.clear();
         walk(data);
         pages++;
-        if (token == null) break;
-        data = await post({'context': context, 'continuation': token});
+        if (tokens.isEmpty) break;
+        final token = tokens.last;
+        if (!used.add(token)) break; // same token again, stop
+        data = await post({'continuation': token});
       }
     } catch (e) {
-      _dl.log('Direct YouTube request failed ($e)');
+      _dl.log('YouTube Music request failed ($e)');
     }
     return songs;
   }
