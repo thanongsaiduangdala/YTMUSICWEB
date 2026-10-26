@@ -26,3 +26,5 @@
    HLS log lines now show which parts YouTube's iPhone-app reply had.
 9. Songs that are not playing: the download opens the song in the YouTube page (muted, up to 45 s), grabs its link, then pauses.
    A song the library cannot read ("video is not available") no longer stops the download before the page link is tried.
+10. Early-press / VPN: before opening a song, wait (up to 30 s) for the YouTube page to finish loading, re-inject the hook while
+    waiting, and write a "Page report" into the download log if no link shows up in 45 s.

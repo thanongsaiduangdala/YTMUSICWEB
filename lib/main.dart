@@ -2733,29 +2733,60 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   // that is already playing there is never touched.)
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?>
       _openInPageForLink(String vid) async {
-    try {
-      final run = audioHandler.runJsResult;
-      var cur = '';
+    final run = audioHandler.runJsResult;
+    Future<String> ask(String js) async {
       try {
-        final r = await run?.call(
-            "(function(){try{var p=document.getElementById('movie_player');return p&&p.getVideoData?p.getVideoData().video_id:''}catch(e){return ''}})()");
-        cur = (r ?? '').toString().replaceAll('"', '');
-      } catch (_) {}
+        final r = await run?.call(js);
+        return (r ?? '').toString().replaceAll('"', '');
+      } catch (e) {
+        return 'error: $e';
+      }
+    }
+
+    try {
+      // 1) let the page finish loading first (right after launch, or on a slow
+      //    VPN, it may still be loading; opening a song now would cut it off)
+      final ready = DateTime.now().add(const Duration(seconds: 30));
+      var pageReady = false;
+      while (DateTime.now().isBefore(ready)) {
+        try {
+          await _controller.runJavaScript(WebAudioHandler.gvHookJs);
+        } catch (_) {}
+        final st = await ask(
+            "document.readyState+'|'+(window.__gv?'hook':'nohook')+'|'+location.hostname");
+        if (st.startsWith('complete|hook|music.youtube.com')) {
+          pageReady = true;
+          break;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+      }
+      if (!pageReady) {
+        _dl.log('The YouTube page was not ready after 30 s (${await ask("document.readyState+'|'+location.href.slice(0,60)")})');
+      }
+      // 2) open the song unless the page is already on it
+      final cur = await ask(
+          "(function(){try{var p=document.getElementById('movie_player');return p&&p.getVideoData?p.getVideoData().video_id:''}catch(e){return ''}})()");
       if (cur != vid) {
         await _controller
             .loadRequest(Uri.parse('https://music.youtube.com/watch?v=$vid'));
       }
+      // 3) wait for the page to ask for this song's audio
       final until = DateTime.now().add(const Duration(seconds: 45));
       while (DateTime.now().isBefore(until)) {
         await Future<void>.delayed(const Duration(milliseconds: 700));
         try {
+          await _controller.runJavaScript(WebAudioHandler.gvHookJs);
           await _controller.runJavaScript(
               "var v=document.querySelector('video');if(v){v.muted=true;if(v.paused){v.play();}}");
         } catch (_) {}
         final l = await _pageAudioLink(vid, quiet: true);
         if (l != null) return l;
       }
-    } catch (_) {
+      var diag = await ask('window.__gvDiag ? window.__gvDiag() : "hook missing"');
+      if (diag.length > 700) diag = diag.substring(0, 700);
+      _dl.log('Page report after 45 s: $diag');
+    } catch (e) {
+      _dl.log('Opening the song in the page failed ($e)');
     } finally {
       try {
         await _controller.runJavaScript(
