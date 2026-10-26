@@ -2742,6 +2742,17 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _openInPageForLink(String vid) async {
     _lastPageSabr = false;
     final run = audioHandler.runJsResult;
+    // iPhone: WebKit freezes a muted video whose web view is hidden behind
+    // another tab (Download / Sound). Songs that are not playing (library and
+    // playlist downloads) then never ask for their audio and no link shows up.
+    // So the web page is brought to the front while the link is captured, and
+    // the tab the person was on comes back afterwards.
+    final tabBefore = _tab;
+    final showedWeb = Platform.isIOS && mounted && _appTab;
+    if (showedWeb) {
+      setState(() => _tab = _lastWebTab);
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+    }
     Future<String> ask(String js) async {
       try {
         final r = await run?.call(js);
@@ -2825,6 +2836,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         await _controller.runJavaScript(
             "var v=document.querySelector('video');if(v){v.pause();v.muted=false;}");
       } catch (_) {}
+      if (showedWeb && mounted && _tab == _lastWebTab) {
+        setState(() => _tab = tabBefore);
+      }
     }
     return null;
   }
