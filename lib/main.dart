@@ -1285,6 +1285,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   Map<String, int> _lastPlayed = {};
   // Setting: only download on Wi-Fi (downloads wait on mobile data).
   bool _wifiOnly = false;
+  // Setting: Reset page session also starts the 15-second download warm-up
+  // again (like a fresh install). On by default.
+  bool _resetWarmOnSession = true;
   // Setting: MP3 quality of new downloads: 'high' (best), 'medium', 'small'.
   String _quality = 'high';
   // Auto-retry: tries used per song (video id), and the file name to reuse so
@@ -1343,6 +1346,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _smartOn = prefs.getBool('smart_on') ?? false;
       _preferOffline = prefs.getBool('prefer_offline') ?? true;
       _wifiOnly = prefs.getBool('wifi_only') ?? false;
+      _resetWarmOnSession = prefs.getBool('reset_warm_on_session') ?? true;
       final q = prefs.getString('dl_quality') ?? 'high';
       _quality = (q == 'medium' || q == 'small') ? q : 'high';
       _sortMode = (prefs.getInt('sort_mode') ?? 0).clamp(0, 3) as int;
@@ -1391,6 +1395,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           quality: _quality,
           onWifiOnly: _setWifiOnly,
           onQuality: _setQuality,
+          resetWarm: _resetWarmOnSession,
+          onResetWarm: _setResetWarm,
         ),
         smartCard: () => _SmartDownloadCard(
           on: _smartOn,
@@ -1410,6 +1416,13 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         .then((p) => p.setBool('prefer_offline', on));
     _syncLocalVids(); // tells the website which songs it may swap
     _touch(); // redraws the open Settings page
+  }
+
+  void _setResetWarm(bool on) {
+    setState(() => _resetWarmOnSession = on);
+    SharedPreferences.getInstance()
+        .then((p) => p.setBool('reset_warm_on_session', on));
+    _touch();
   }
 
   void _setWifiOnly(bool on) {
@@ -2731,6 +2744,83 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     } catch (_) {
       return null;
     }
+  }
+
+  // ---- Warm-up: the page must look like a real listener --------------------
+  // On a fresh install YouTube may refuse downloads until the page has been used
+  // like a normal listener. So on iPhone the download list waits until the
+  // person either is signed in to YouTube Music, or has listened to 15 seconds
+  // of music in the page. After that it is remembered for good (saved on the
+  // phone), so it never waits again, also after the app is closed and opened.
+  static const int _warmNeedSecs = 15;
+  bool _dlWarm = !Platform.isIOS; // iPhone: false until the warm-up is done
+  int _warmSecs = 0;
+  Timer? _warmTimer;
+
+  static const _signedInJs =
+      "(function(){try{if(window.ytcfg&&ytcfg.get&&ytcfg.get('LOGGED_IN'))return true;}catch(e){}return /(^|; )(SAPISID|__Secure-3PAPISID)=/.test(document.cookie);})()";
+
+  Future<void> _initWarmup() async {
+    if (!Platform.isIOS) return; // Android downloads with yt-dlp
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool('dl_warm') == true) {
+        _dlWarm = true;
+        return;
+      }
+    } catch (_) {}
+    _dlWarm = false;
+    _warmTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (!mounted || _dlWarm) return;
+      try {
+        final playing = (await _controller
+                .runJavaScriptReturningResult(_isPlayingJs)
+                .timeout(const Duration(seconds: 3)))
+            .toString();
+        if (playing == 'true' || playing == '1') _warmSecs++;
+        var why = '';
+        if (_warmSecs >= _warmNeedSecs) {
+          why = 'listened for $_warmNeedSecs seconds';
+        } else {
+          final signed = (await _controller
+                  .runJavaScriptReturningResult(_signedInJs)
+                  .timeout(const Duration(seconds: 3)))
+              .toString();
+          if (signed == 'true' || signed == '1') why = 'signed in to YouTube Music';
+        }
+        if (why.isNotEmpty) await _finishWarmup(why);
+      } catch (_) {}
+    });
+  }
+
+  // Starts the warm-up from zero again (used by Reset page session).
+  Future<void> _restartWarmup() async {
+    if (!Platform.isIOS) return; // Android downloads with yt-dlp
+    _warmTimer?.cancel();
+    _warmTimer = null;
+    _warmSecs = 0;
+    _dlWarm = false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('dl_warm');
+    } catch (_) {}
+    _dl.log('Page session reset: download warm-up starts again (15 s).');
+    _dl.changed();
+    if (mounted) setState(() {});
+    await _initWarmup();
+  }
+
+  Future<void> _finishWarmup(String why) async {
+    _warmTimer?.cancel();
+    _warmTimer = null;
+    _dlWarm = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('dl_warm', true);
+    } catch (_) {}
+    _dl.log('Download warm-up done ($why). Downloads can start.');
+    _dl.changed();
+    if (mounted) setState(() {});
   }
 
   // ---- The download page ------------------------------------------------------
@@ -4212,6 +4302,16 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     var outdatedHint = false;
     try {
       while (mounted && _dl.pending.isNotEmpty && !_batchCancel) {
+        // Fresh install (iPhone): wait until the page has been used like a real
+        // listener (signed in, or 15 s of music), so YouTube does not refuse.
+        if (!_dlWarm) {
+          final left = math.max(0, _warmNeedSecs - _warmSecs);
+          _dl.batchStatus =
+              'Play a song for $left more second(s) (or sign in to YouTube Music) so downloads work';
+          _dl.changed();
+          await Future.delayed(const Duration(seconds: 1));
+          continue;
+        }
         // Wi-Fi only: wait here (also after the app restarts) and carry on by
         // itself as soon as Wi-Fi is back.
         // Same when there is no internet at all: wait, then carry on.
@@ -5135,6 +5235,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadSaved();
+    _initWarmup();
     // iPhone: let the page play inline and start music without a tap
     // (otherwise the website's player stays silent).
     PlatformWebViewControllerCreationParams webParams =
@@ -5217,6 +5318,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       await _controller.clearCache();
       await _controller.loadRequest(Uri.parse('https://music.youtube.com'));
       await _closeDownloadWeb(); // it signs in again from the fresh session
+      if (_resetWarmOnSession) await _restartWarmup();
     };
     audioHandler.runJs = (js) => _controller.runJavaScript(js);
     audioHandler.runJsResult = (js) => _controller.runJavaScriptReturningResult(js);
@@ -5264,6 +5366,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     playerOpts.onShuffleChanged = null;
     WidgetsBinding.instance.removeObserver(this);
     _smartTimer?.cancel();
+    _warmTimer?.cancel();
     _dlQuery.dispose();
     _dlFilter.dispose();
     _dlSearchCtl.dispose();
@@ -6423,12 +6526,16 @@ class _DownloadSettingsCard extends StatelessWidget {
   final String quality; // high | medium | small
   final ValueChanged<bool> onWifiOnly;
   final ValueChanged<String> onQuality;
+  final bool resetWarm;
+  final ValueChanged<bool> onResetWarm;
 
   const _DownloadSettingsCard({
     required this.wifiOnly,
     required this.quality,
     required this.onWifiOnly,
     required this.onQuality,
+    required this.resetWarm,
+    required this.onResetWarm,
   });
 
   static const _hints = {
@@ -6456,6 +6563,16 @@ class _DownloadSettingsCard extends StatelessWidget {
                   style: TextStyle(fontWeight: FontWeight.w600)),
               subtitle: const Text(
                   'On mobile data, downloads (including Smart download) wait and carry on by themselves when Wi-Fi is back.'),
+            ),
+            const Divider(height: 24),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: resetWarm,
+              onChanged: onResetWarm,
+              title: const Text('Reset 15-second wait on page reset',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text(
+                  'When you reset the page session (Personalize sound), downloads wait for 15 seconds of music or a sign-in again, like on a fresh install. iPhone only.'),
             ),
             const Divider(height: 24),
             const Text('Download quality',
