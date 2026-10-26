@@ -641,24 +641,60 @@ class WebAudioHandler extends BaseAudioHandler {
   if (window.__gv) return;
   var log = [];
   window.__gv = { log: log, audio: null };
+  // Ask the page for AAC (MP4) audio instead of Opus (WebM): iPhone cannot play Opus.
+  function noOpus(t) {
+    t = String(t || '').toLowerCase();
+    return t.indexOf('opus') >= 0 || t.indexOf('audio/webm') >= 0;
+  }
+  try {
+    ['MediaSource', 'ManagedMediaSource'].forEach(function (n) {
+      var C = window[n];
+      if (!C || !C.isTypeSupported) return;
+      var f = C.isTypeSupported.bind(C);
+      C.isTypeSupported = function (t) { return noOpus(t) ? false : f(t); };
+    });
+    var cp = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function (t) {
+      return noOpus(t) ? '' : cp.call(this, t);
+    };
+  } catch (e) {}
   function curVid() {
     try {
       var pl = document.getElementById('movie_player');
       return pl && pl.getVideoData ? (pl.getVideoData().video_id || '') : '';
     } catch (e) { return ''; }
   }
-  function note(kind, method, url, bodyLen) {
+  function bodyInfo(body) {
+    var len = 0, b64 = '';
+    try {
+      var u8 = null;
+      if (body instanceof ArrayBuffer) u8 = new Uint8Array(body);
+      else if (body && ArrayBuffer.isView(body)) u8 = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+      if (u8) {
+        len = u8.length;
+        if (len <= 256) { var s = ''; for (var i = 0; i < len; i++) s += String.fromCharCode(u8[i]); b64 = btoa(s); }
+      } else if (typeof body === 'string') {
+        len = body.length;
+        if (len <= 256) b64 = btoa(unescape(encodeURIComponent(body)));
+      }
+    } catch (e) {}
+    return { len: len, b64: b64 };
+  }
+  function note(kind, method, url, body) {
     try {
       if (!/googlevideo\.com\/videoplayback/.test(url)) return;
       var u = new URL(url, location.href), p = u.searchParams;
       var mime = p.get('mime') || '';
-      log.push({ kind: kind, method: method, host: u.host, mime: mime,
-                 itag: p.get('itag'), pot: p.has('pot'), sabr: p.has('sabr'),
-                 range: p.get('range'), clen: p.get('clen'), bodyLen: bodyLen || 0 });
+      var bi = bodyInfo(body);
+      method = String(method || 'GET').toUpperCase();
+      log.push({ kind: kind, method: method, mime: mime, itag: p.get('itag'),
+                 pot: p.has('pot'), sabr: p.has('sabr'), ump: p.has('ump'),
+                 range: p.get('range'), clen: p.get('clen'), bodyLen: bi.len });
       if (log.length > 30) log.shift();
-      if (mime.indexOf('audio') === 0 && String(method).toUpperCase() === 'GET' && !p.has('sabr')) {
+      if (mime.indexOf('audio') === 0 && !p.has('sabr')) {
         window.__gv.audio = { url: u.href, mime: mime, itag: p.get('itag'),
-                              clen: p.get('clen'), vid: curVid() };
+                              clen: p.get('clen'), vid: curVid(), method: method,
+                              ump: p.has('ump'), body: bi.b64, bodyLen: bi.len };
       }
     } catch (e) {}
   }
@@ -668,8 +704,7 @@ class WebAudioHandler extends BaseAudioHandler {
       try {
         var url = typeof input === 'string' ? input : (input && input.url);
         var m = (init && init.method) || (input && input.method) || 'GET';
-        var b = init && init.body && (init.body.byteLength || init.body.length || init.body.size);
-        note('fetch', m, String(url), b);
+        note('fetch', m, String(url), init && init.body);
       } catch (e) {}
       return of.apply(this, arguments);
     };
@@ -680,7 +715,7 @@ class WebAudioHandler extends BaseAudioHandler {
     return ox.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function (b) {
-    try { note('xhr', this.__gm, String(this.__gu), b && (b.byteLength || b.length || b.size)); } catch (e) {}
+    try { note('xhr', this.__gm, String(this.__gu), b); } catch (e) {}
     return os.apply(this, arguments);
   };
   window.__gvDiag = function () {
@@ -689,13 +724,15 @@ class WebAudioHandler extends BaseAudioHandler {
       hookInstalled: true,
       playingVideo: curVid(),
       audioLinkCaptured: !!a,
-      audio: a ? { itag: a.itag, mime: a.mime, bytes: a.clen, video: a.vid,
+      audio: a ? { method: a.method, itag: a.itag, mime: a.mime, bytes: a.clen,
+                   video: a.vid, ump: a.ump, bodyLen: a.bodyLen,
                    hasPot: /[?&]pot=/.test(a.url) } : null,
-      lastRequests: log.slice(-8)
+      lastRequests: log.slice(-6)
     });
   };
 })();
 ''';
+
 
   // Personalize sound for songs streaming from the website: the site's own
   // <video> is routed through a Web Audio chain (10 filters + booster + a
@@ -2641,7 +2678,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   // The audio link the YouTube Music page itself is using for the song that is
   // playing right now (it already carries YouTube's tokens). Null if the page
   // has not used a plain link for this song, or it is not an AAC / MP4 stream.
-  Future<({Uri url, int size})?> _pageAudioLink(String vid) async {
+  Future<({Uri url, int size, bool post, List<int> body})?> _pageAudioLink(
+      String vid) async {
     try {
       final run = audioHandler.runJsResult;
       if (run == null) return null;
@@ -2650,15 +2688,38 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           .toString();
       if (t.startsWith('"')) t = jsonDecode(t) as String;
       final d = jsonDecode(t);
-      if (d is! Map) return null;
-      if ('${d['vid']}' != vid) return null;
-      if (!'${d['mime']}'.contains('mp4')) return null;
+      if (d is! Map) {
+        _dl.log('The page has not fetched audio for a song yet');
+        return null;
+      }
+      if ('${d['vid']}' != vid) {
+        _dl.log('The page link is for another song (play this one first)');
+        return null;
+      }
+      final mime = '${d['mime']}';
+      if (!mime.contains('mp4')) {
+        _dl.log(
+            'The page is streaming $mime (itag ${d['itag']}), which iPhone cannot play. Skip to the next song and back, then try again');
+        return null;
+      }
+      if (d['ump'] == true) {
+        _dl.log('The page link uses a wrapped format (ump), not supported');
+        return null;
+      }
       final size = int.tryParse('${d['clen']}') ?? 0;
       if (size <= 0) return null;
       // drop the page's own range / pacing parts; pieces add their own range
       final clean = '${d['url']}'.replaceAll(RegExp(r'[&?](range|rn|rbuf)=[^&]*'), '');
       final fixed = clean.contains('?') ? clean : clean.replaceFirst('&', '?');
-      return (url: Uri.parse(fixed), size: size);
+      final post = '${d['method']}'.toUpperCase() == 'POST';
+      var body = <int>[];
+      final b64 = '${d['body'] ?? ''}';
+      if (b64.isNotEmpty) {
+        try {
+          body = base64Decode(b64);
+        } catch (_) {}
+      }
+      return (url: Uri.parse(fixed), size: size, post: post, body: body);
     } catch (_) {
       return null;
     }
@@ -2846,7 +2907,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       // 2 + 3) small pieces. Each piece is tried up to 4 times: Range header,
       // then "&range=" in the link (how the YouTube site asks), then again
       // after getting a fresh link.
-      Future<void> viaPieces(Uri start, String ua, {required bool refresh}) async {
+      Future<void> viaPieces(Uri start, String ua,
+          {required bool refresh,
+          bool post = false,
+          List<int> postBody = const []}) async {
         final client = http.Client();
         final hook = () => client.close();
         hooks.add(hook);
@@ -2876,18 +2940,22 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
                   }
                 } catch (_) {}
               }
-              final asQuery = attempt.isOdd;
+              final asQuery = post || attempt.isOdd;
               final target =
                   asQuery ? Uri.parse('$url&range=$got-$end') : url;
               try {
-                final res = await client.get(target, headers: {
+                final hdrs = {
                   'User-Agent': ua,
                   'Accept': '*/*',
                   'Accept-Language': 'en-US,en;q=0.9',
                   if (!asQuery) 'Range': 'bytes=$got-$end',
                   if (web) 'Origin': 'https://music.youtube.com',
                   if (web) 'Referer': 'https://music.youtube.com/',
-                }).timeout(const Duration(seconds: 25));
+                };
+                final res = await (post
+                        ? client.post(target, headers: hdrs, body: postBody)
+                        : client.get(target, headers: hdrs))
+                    .timeout(const Duration(seconds: 25));
                 check();
                 if ((res.statusCode == 200 || res.statusCode == 206) &&
                     res.bodyBytes.isNotEmpty) {
@@ -2931,7 +2999,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         final keepTotal = total;
         total = page.size;
         try {
-          await viaPieces(page.url, _uaSafari, refresh: false);
+          await viaPieces(page.url, _uaSafari,
+              refresh: false, post: page.post, postBody: page.body);
         } catch (e) {
           check();
           _dl.log('Page link failed ($e)');

@@ -17,3 +17,6 @@
 5. Download via the YouTube page's own link
    - lib/main.dart: the page is hooked (`gvHookJs`) to note the audio link it uses; the download tries that link first
      (only for the song currently playing). New button "Check download link" under the equalizer shows what the page used.
+6. Page link v2: the page fetches audio with POST (itag 251, Opus/WebM, with pot token). The hook now asks the page for AAC
+   (MediaSource.isTypeSupported / canPlayType say no to Opus/WebM), captures POST links + body, and the download replays
+   them as POST with &range= pieces. The check dialog shows method / itag / mime / ump.
