@@ -2679,7 +2679,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   // The audio link the YouTube Music page itself is using for the song that is
   // playing right now (it already carries YouTube's tokens). Null if the page
   // has not used a plain link for this song, or it is not an AAC / MP4 stream.
-  Future<({Uri url, int size, bool post, List<int> body})?> _pageAudioLink(
+  Future<({Uri url, int size, bool post, List<int> body, bool ump})?> _pageAudioLink(
       String vid) async {
     try {
       final run = audioHandler.runJsResult;
@@ -2703,10 +2703,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             'The page is streaming $mime (itag ${d['itag']}), which iPhone cannot play. Skip to the next song and back, then try again');
         return null;
       }
-      if (d['ump'] == true) {
-        _dl.log('The page link uses a wrapped format (ump), not supported');
-        return null;
-      }
       final size = int.tryParse('${d['clen']}') ?? 0;
       if (size <= 0) return null;
       // drop the page's own range / pacing parts; pieces add their own range
@@ -2720,7 +2716,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           body = base64Decode(b64);
         } catch (_) {}
       }
-      return (url: Uri.parse(fixed), size: size, post: post, body: body);
+      return (
+          url: Uri.parse(fixed),
+          size: size,
+          post: post,
+          body: body,
+          ump: d['ump'] == true);
     } catch (_) {
       return null;
     }
@@ -2786,7 +2787,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           }
           final ps = data is Map ? data['playabilityStatus'] : null;
           _dl.log(
-              'No HLS from ${c['clientVersion']}@$host (${ps is Map ? '${ps['status']}: ${ps['reason'] ?? ''}' : 'no status'})');
+              'No HLS from ${c['clientVersion']}@$host (${ps is Map ? '${ps['status']}: ${ps['reason'] ?? ''}' : 'no status'}; streamingData: ${sd is Map ? sd.keys.join(',') : 'none'})');
         } catch (e) {
           _dl.log('Player request ${c['clientVersion']}@$host failed ($e)');
         }
@@ -2853,6 +2854,49 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       return muxed.first.uri;
     }
     return null;
+  }
+
+  // YouTube's "UMP" wrapper: a list of parts (type, size, data). Part 21 holds
+  // the audio bytes (after one id byte). Returns just the audio, joined.
+  Uint8List _umpMedia(Uint8List d) {
+    final out = BytesBuilder(copy: false);
+    var i = 0;
+    int? varint() {
+      if (i >= d.length) return null;
+      final b = d[i];
+      final n = b < 128 ? 1 : b < 192 ? 2 : b < 224 ? 3 : b < 240 ? 4 : 5;
+      if (i + n > d.length) return null;
+      int v;
+      switch (n) {
+        case 1:
+          v = b;
+          break;
+        case 2:
+          v = (b & 0x3f) + 64 * d[i + 1];
+          break;
+        case 3:
+          v = (b & 0x1f) + 32 * (d[i + 1] + 256 * d[i + 2]);
+          break;
+        case 4:
+          v = (b & 0x0f) + 16 * (d[i + 1] + 256 * (d[i + 2] + 256 * d[i + 3]));
+          break;
+        default:
+          v = d[i + 1] + 256 * (d[i + 2] + 256 * (d[i + 3] + 256 * d[i + 4]));
+      }
+      i += n;
+      return v;
+    }
+
+    while (i < d.length) {
+      final type = varint();
+      final size = varint();
+      if (type == null || size == null || i + size > d.length) break;
+      if (type == 21 && size > 1) {
+        out.add(Uint8List.sublistView(d, i + 1, i + size));
+      }
+      i += size;
+    }
+    return out.takeBytes();
   }
 
   // MPEG-TS -> the raw AAC (ADTS) audio inside it. [pids] remembers which
@@ -3074,6 +3118,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       Future<void> viaPieces(Uri start, String ua,
           {required bool refresh,
           bool post = false,
+          bool ump = false,
           List<int> postBody = const []}) async {
         final client = http.Client();
         final hook = () => client.close();
@@ -3087,6 +3132,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             final end = math.min(got + piece, total) - 1;
             Object? lastErr;
             http.Response? ok;
+            Uint8List? okData;
             for (var attempt = 0; attempt < 4 && ok == null; attempt++) {
               check();
               if (attempt == 2 && refresh) {
@@ -3126,7 +3172,13 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
                   if (res.statusCode == 200 && got > 0 && !asQuery) {
                     lastErr = 'YouTube ignored the range request';
                   } else {
-                    ok = res;
+                    final data = ump ? _umpMedia(res.bodyBytes) : res.bodyBytes;
+                    if (data.isEmpty) {
+                      lastErr = 'no audio inside the reply';
+                    } else {
+                      ok = res;
+                      okData = data;
+                    }
                   }
                 } else {
                   lastErr = 'HTTP ${res.statusCode}';
@@ -3144,10 +3196,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             if (ok == null) {
               throw Exception('YouTube refused the download ($lastErr)');
             }
-            sink!.add(ok.bodyBytes);
-            got += ok.bodyBytes.length;
+            sink!.add(okData!);
+            got += okData.length;
             progress();
-            if (ok.statusCode == 200 && ok.bodyBytes.length >= total) break;
+            if (ok.statusCode == 200 && okData.length >= total) break;
           }
         } finally {
           hooks.remove(hook);
@@ -3164,7 +3216,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         total = page.size;
         try {
           await viaPieces(page.url, _uaSafari,
-              refresh: false, post: page.post, postBody: page.body);
+              refresh: false,
+              post: page.post,
+              ump: page.ump,
+              postBody: page.body);
         } catch (e) {
           check();
           _dl.log('Page link failed ($e)');

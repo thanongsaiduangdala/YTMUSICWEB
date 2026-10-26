@@ -22,3 +22,5 @@
    them as POST with &range= pieces. The check dialog shows method / itag / mime / ump.
 7. HLS download (the way MaxMusic does it): asks the iPhone-app endpoint for the song's HLS playlist (hlsManifestUrl), picks the
    audio-only playlist, downloads the parts and joins them (fMP4 -> .m4a, MPEG-TS -> raw AAC .aac). Tried before the old routes.
+8. UMP: the page's audio replies are wrapped in YouTube's "UMP" format. The page-link download now unwraps them (part type 21).
+   HLS log lines now show which parts YouTube's iPhone-app reply had.
