@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:audio_metadata_reader/audio_metadata_reader.dart';
 import 'package:audio_service/audio_service.dart';
@@ -2725,6 +2726,167 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
+  // HLS: YouTube's iPhone app also gets the song as an HLS playlist (many small
+  // parts), which is not blocked like the plain links are. Returns its address.
+  Future<String?> _hlsManifestFor(String vid) async {
+    final clients = <Map<String, dynamic>>[
+      {
+        'clientName': 'IOS',
+        'clientVersion': '20.10.4',
+        'deviceMake': 'Apple',
+        'deviceModel': 'iPhone16,2',
+        'osName': 'iPhone',
+        'osVersion': '18.3.2.22D82',
+        'hl': 'en',
+        'gl': 'US',
+        'userAgent': _uaIos,
+      },
+      {
+        'clientName': 'IOS',
+        'clientVersion': '19.05.36',
+        'deviceModel': 'iPhone14,5',
+        'osVersion': '16.5',
+        'hl': 'en',
+        'gl': 'US',
+        'userAgent':
+            'com.google.ios.youtube/19.05.36 (iPhone14,5; U; CPU iOS 16_5 like Mac OS X)',
+      },
+    ];
+    const hosts = ['youtubei.googleapis.com', 'www.youtube.com'];
+    for (final c in clients) {
+      for (final host in hosts) {
+        try {
+          final res = await http
+              .post(
+                Uri.parse('https://$host/youtubei/v1/player?prettyPrint=false'),
+                headers: {
+                  'Content-Type': 'application/json',
+                  'User-Agent': '${c['userAgent']}',
+                  'X-YouTube-Client-Name': '5',
+                  'X-YouTube-Client-Version': '${c['clientVersion']}',
+                },
+                body: jsonEncode({
+                  'context': {'client': c},
+                  'videoId': vid,
+                  'contentCheckOk': true,
+                  'racyCheckOk': true,
+                }),
+              )
+              .timeout(const Duration(seconds: 20));
+          if (res.statusCode != 200) {
+            _dl.log('Player request ${c['clientVersion']}@$host: HTTP ${res.statusCode}');
+            continue;
+          }
+          final data = jsonDecode(utf8.decode(res.bodyBytes));
+          final sd = data is Map ? data['streamingData'] : null;
+          final hls = sd is Map ? (sd['hlsManifestUrl'] ?? sd['hlsManifestURL']) : null;
+          if (hls is String && hls.isNotEmpty) {
+            _dl.log('Got the HLS playlist (iPhone app ${c['clientVersion']})');
+            return hls;
+          }
+          final ps = data is Map ? data['playabilityStatus'] : null;
+          _dl.log(
+              'No HLS from ${c['clientVersion']}@$host (${ps is Map ? '${ps['status']}: ${ps['reason'] ?? ''}' : 'no status'})');
+        } catch (e) {
+          _dl.log('Player request ${c['clientVersion']}@$host failed ($e)');
+        }
+      }
+    }
+    return null;
+  }
+
+  // From an HLS master list: the audio-only playlist (quality as chosen).
+  Uri? _hlsPickAudio(Uri base, String master, String quality) {
+    final audioOnly = <({int bw, Uri uri})>[];
+    final renditions = <Uri>[];
+    final muxed = <({int bw, Uri uri})>[];
+    final lines = const LineSplitter().convert(master);
+    Map<String, String> attrs(String l) {
+      final m = <String, String>{};
+      for (final x in RegExp(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+          .allMatches(l.substring(l.indexOf(':') + 1))) {
+        var v = x.group(2)!;
+        if (v.startsWith('"')) v = v.substring(1, v.length - 1);
+        m[x.group(1)!] = v;
+      }
+      return m;
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+      final l = lines[i].trim();
+      if (l.startsWith('#EXT-X-MEDIA:')) {
+        final a = attrs(l);
+        if (a['TYPE'] == 'AUDIO' && a['URI'] != null) {
+          renditions.add(base.resolve(a['URI']!));
+        }
+      } else if (l.startsWith('#EXT-X-STREAM-INF:')) {
+        final a = attrs(l);
+        final bw = int.tryParse(a['BANDWIDTH'] ?? '') ?? 0;
+        var j = i + 1;
+        while (j < lines.length &&
+            (lines[j].trim().isEmpty || lines[j].trim().startsWith('#'))) {
+          j++;
+        }
+        if (j >= lines.length) continue;
+        final u = base.resolve(lines[j].trim());
+        final codecs = a['CODECS'] ?? '';
+        if (codecs.contains('mp4a') &&
+            !RegExp(r'avc1|vp0?9|av01|hvc1|hev1').hasMatch(codecs)) {
+          audioOnly.add((bw: bw, uri: u));
+        } else {
+          muxed.add((bw: bw, uri: u));
+        }
+      }
+    }
+    int byBw(({int bw, Uri uri}) a, ({int bw, Uri uri}) b) => a.bw.compareTo(b.bw);
+    if (audioOnly.isNotEmpty) {
+      audioOnly.sort(byBw);
+      return quality == 'small'
+          ? audioOnly.first.uri
+          : (quality == 'medium'
+              ? audioOnly[audioOnly.length ~/ 2].uri
+              : audioOnly.last.uri);
+    }
+    if (renditions.isNotEmpty) return renditions.last;
+    if (muxed.isNotEmpty) {
+      muxed.sort(byBw);
+      return muxed.first.uri;
+    }
+    return null;
+  }
+
+  // MPEG-TS -> the raw AAC (ADTS) audio inside it. [pids] remembers which
+  // stream is the audio between parts.
+  Uint8List _tsToAdts(Uint8List d, Set<int> pids) {
+    final out = BytesBuilder(copy: false);
+    for (var i = 0; i + 188 <= d.length; i += 188) {
+      if (d[i] != 0x47) continue;
+      final pusi = (d[i + 1] & 0x40) != 0;
+      final pid = ((d[i + 1] & 0x1F) << 8) | d[i + 2];
+      final afc = (d[i + 3] >> 4) & 3;
+      if (afc == 0 || afc == 2) continue;
+      var p = i + 4;
+      if (afc == 3) p += 1 + d[i + 4];
+      final end = i + 188;
+      if (p >= end) continue;
+      if (pusi) {
+        if (end - p >= 9 && d[p] == 0 && d[p + 1] == 0 && d[p + 2] == 1) {
+          final sid = d[p + 3];
+          if (sid >= 0xC0 && sid <= 0xDF) {
+            pids.add(pid);
+            p += 9 + d[p + 8];
+            if (p < end) out.add(Uint8List.sublistView(d, p, end));
+          } else {
+            pids.remove(pid);
+          }
+        }
+        continue;
+      }
+      if (pids.contains(pid)) out.add(Uint8List.sublistView(d, p, end));
+    }
+    return out.takeBytes();
+  }
+
   // Asks YouTube's iPhone app endpoint for the audio links directly. Used only
   // when the library's own links are refused. Returns (url, bytes) or null.
   Future<({Uri url, int size})?> _iosAppAudioLink(String vid, int wantBytes,
@@ -2809,6 +2971,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
 
     final out = File('${dir.path}/$id.m4a');
+    var outPath = out.path;
+    var rawAdts = false;
     IOSink? sink;
     try {
       _dl.log('Asking YouTube for the audio streams...');
@@ -3012,6 +3176,99 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       } else {
         _dl.log('No usable link from the YouTube page for this song');
       }
+      // 0b) HLS playlist from the iPhone app endpoint (many small parts)
+      Future<bool> viaHls() async {
+        _dl.log('Asking YouTube for the HLS playlist...');
+        final manifestUrl = await _hlsManifestFor(vid);
+        check();
+        if (manifestUrl == null) throw Exception('YouTube gave no HLS playlist');
+        final client = http.Client();
+        final hook = () => client.close();
+        hooks.add(hook);
+        try {
+          Future<http.Response> fetch(Uri u) async {
+            Object? err;
+            for (var a = 0; a < 3; a++) {
+              check();
+              try {
+                final r = await client
+                    .get(u, headers: {'User-Agent': _uaIos})
+                    .timeout(const Duration(seconds: 25));
+                check();
+                if (r.statusCode == 200 && r.bodyBytes.isNotEmpty) return r;
+                err = 'HTTP ${r.statusCode}';
+              } on TimeoutException {
+                err = 'timeout';
+              } catch (e) {
+                check();
+                err = e;
+              }
+              await Future<void>.delayed(const Duration(milliseconds: 500));
+            }
+            throw Exception('HLS: $err');
+          }
+
+          final base = Uri.parse(manifestUrl);
+          var text = utf8.decode((await fetch(base)).bodyBytes, allowMalformed: true);
+          var mediaBase = base;
+          if (!text.contains('#EXTINF')) {
+            final pick = _hlsPickAudio(base, text, _quality);
+            if (pick == null) throw Exception('no audio playlist in the HLS list');
+            mediaBase = pick;
+            text = utf8.decode((await fetch(pick)).bodyBytes, allowMalformed: true);
+          }
+          Uri? init;
+          final segs = <Uri>[];
+          for (final l in const LineSplitter().convert(text)) {
+            final t = l.trim();
+            if (t.isEmpty) continue;
+            if (t.startsWith('#EXT-X-MAP:')) {
+              final m = RegExp(r'URI="([^"]+)"').firstMatch(t);
+              if (m != null) init = mediaBase.resolve(m.group(1)!);
+            } else if (!t.startsWith('#')) {
+              segs.add(mediaBase.resolve(t));
+            }
+          }
+          if (segs.isEmpty) throw Exception('the HLS playlist has no parts');
+          _dl.log('HLS: ${segs.length} parts');
+          await restart();
+          var raw = false;
+          final pids = <int>{};
+          if (init != null) {
+            final r = await fetch(init);
+            sink!.add(r.bodyBytes);
+            got += r.bodyBytes.length;
+          }
+          for (var i = 0; i < segs.length; i++) {
+            final r = await fetch(segs[i]);
+            var bytes = r.bodyBytes;
+            if (i == 0 && init == null && bytes[0] == 0x47) raw = true;
+            if (raw) bytes = _tsToAdts(bytes, pids);
+            sink!.add(bytes);
+            got += bytes.length;
+            total = got * segs.length ~/ (i + 1);
+            progress();
+          }
+          total = got;
+          return raw;
+        } finally {
+          hooks.remove(hook);
+          client.close();
+        }
+      }
+
+      if (got < total) {
+        final keepTotal = total;
+        try {
+          rawAdts = await viaHls();
+        } catch (e) {
+          check();
+          _dl.log('HLS failed ($e)');
+          total = keepTotal;
+          rawAdts = false;
+          await restart();
+        }
+      }
       try {
         if (got < total) await viaLibrary();
       } catch (e) {
@@ -3053,7 +3310,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         final f = failure;
         throw f is Exception ? f : Exception(f ?? 'Download ended early ($got of $total bytes)');
       }
-      return out.path;
+      if (rawAdts) {
+        // raw AAC from MPEG-TS: give it the ending the player expects
+        outPath = '${dir.path}/$id.aac';
+        await out.rename(outPath);
+      }
+      return outPath;
     } finally {
       try {
         await sink?.close();

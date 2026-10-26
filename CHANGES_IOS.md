@@ -20,3 +20,5 @@
 6. Page link v2: the page fetches audio with POST (itag 251, Opus/WebM, with pot token). The hook now asks the page for AAC
    (MediaSource.isTypeSupported / canPlayType say no to Opus/WebM), captures POST links + body, and the download replays
    them as POST with &range= pieces. The check dialog shows method / itag / mime / ump.
+7. HLS download (the way MaxMusic does it): asks the iPhone-app endpoint for the song's HLS playlist (hlsManifestUrl), picks the
+   audio-only playlist, downloads the parts and joins them (fMP4 -> .m4a, MPEG-TS -> raw AAC .aac). Tried before the old routes.
