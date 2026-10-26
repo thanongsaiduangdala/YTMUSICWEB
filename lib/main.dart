@@ -2684,9 +2684,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   // has not used a plain link for this song, or it is not an AAC / MP4 stream.
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?> _pageAudioLink(
       String vid,
-      {bool quiet = false}) async {
+      {bool quiet = false,
+      Future<Object> Function(String js)? run}) async {
     try {
-      final run = audioHandler.runJsResult;
+      // By default the page the person is using; the download page passes its own.
+      run ??= audioHandler.runJsResult;
       if (run == null) return null;
       var t = (await run('JSON.stringify(window.__gv && window.__gv.audio || null)')
               .timeout(const Duration(seconds: 6)))
@@ -2731,9 +2733,143 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // The song is not the one the page is playing: open it in the page, muted,
-  // just long enough for the page to ask for its audio, then pause. (A song
-  // that is already playing there is never touched.)
+  // ---- The download page ------------------------------------------------------
+  // A second, hidden YouTube Music page used only to read a song's audio link.
+  // The page the person is using is never touched, so the song that is playing
+  // keeps playing while a playlist downloads.
+  WebViewController? _dlWeb;
+  bool _dlWebOn = false; // the hidden page is in the widget tree
+  bool _dlSessionCopied = false;
+
+  // Creates (once) and shows the hidden page, and copies the login of the main
+  // page into it.
+  Future<WebViewController> _ensureDownloadWeb() async {
+    var c = _dlWeb;
+    if (c == null) {
+      PlatformWebViewControllerCreationParams p =
+          const PlatformWebViewControllerCreationParams();
+      if (WebViewPlatform.instance is WebKitWebViewPlatform) {
+        p = WebKitWebViewControllerCreationParams(
+          allowsInlineMediaPlayback: true,
+          mediaTypesRequiringUserAction: const <PlaybackMediaTypes>{},
+        );
+      }
+      final nc = WebViewController.fromPlatformCreationParams(p);
+      c = nc;
+      _dlWeb = nc;
+      await nc.setJavaScriptMode(JavaScriptMode.unrestricted);
+      await nc.setBackgroundColor(Colors.black);
+      await nc.setNavigationDelegate(NavigationDelegate(
+        onPageStarted: (_) {
+          nc.runJavaScript(WebAudioHandler.gvHookJs);
+        },
+        onPageFinished: (_) {
+          nc.runJavaScript(_adBlockJs);
+          nc.runJavaScript(WebAudioHandler.gvHookJs);
+        },
+      ));
+      if (Platform.isIOS) {
+        await nc.setUserAgent(_uaSafari);
+      }
+      _dlSessionCopied = false;
+    }
+    // WebKit freezes a web view that is not on screen. This one is put in the
+    // widget tree far outside the screen: not visible, but still "alive".
+    if (!_dlWebOn && mounted) {
+      setState(() => _dlWebOn = true);
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+    await _copySessionToDownloadWeb(c);
+    return c;
+  }
+
+  // Copies the signed-in session of the main page to the download page.
+  // (On iPhone both pages already share WebKit's cookie store, which also holds
+  // the hidden "HttpOnly" cookies. The explicit copy below adds anything that
+  // is missing, plus the saved page data (localStorage).)
+  Future<void> _copySessionToDownloadWeb(WebViewController dl) async {
+    if (_dlSessionCopied) return;
+    try {
+      // 1) read the main page's cookies + saved data
+      Future<String> readMain(String js) async {
+        final r = await _controller
+            .runJavaScriptReturningResult(js)
+            .timeout(const Duration(seconds: 6));
+        var t = r.toString();
+        if (t.startsWith('"')) t = jsonDecode(t) as String;
+        return t;
+      }
+
+      final onMusic = await readMain('location.hostname');
+      if (!onMusic.contains('youtube.com')) {
+        _dl.log('Download page: the main page is not on YouTube Music yet, session not copied');
+        return;
+      }
+      final cookieText = await readMain('document.cookie');
+      final storage = await readMain(
+          "(function(){var o={};try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);o[k]=localStorage.getItem(k);}}catch(e){}return JSON.stringify(o);})()");
+      // 2) open the YouTube Music page in the download page
+      await dl.loadRequest(Uri.parse('https://music.youtube.com'));
+      for (var i = 0; i < 40; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        final st = (await dl
+                .runJavaScriptReturningResult(
+                    "document.readyState+'|'+location.hostname")
+                .timeout(const Duration(seconds: 5),
+                    onTimeout: () => ''))
+            .toString()
+            .replaceAll('"', '');
+        if (st.startsWith('complete|music.youtube.com')) break;
+      }
+      // 3) cookies the download page does not have yet
+      final have = ((await dl.runJavaScriptReturningResult('document.cookie'))
+              .toString()
+              .replaceAll('"', ''))
+          .split(';')
+          .map((e) => e.trim().split('=').first)
+          .where((e) => e.isNotEmpty)
+          .toSet();
+      var added = 0;
+      final jar = WebViewCookieManager();
+      for (final part in cookieText.split(';')) {
+        final i = part.indexOf('=');
+        if (i <= 0) continue;
+        final name = part.substring(0, i).trim();
+        final value = part.substring(i + 1).trim();
+        if (name.isEmpty || have.contains(name)) continue;
+        await jar.setCookie(WebViewCookie(
+            name: name, value: value, domain: '.youtube.com', path: '/'));
+        added++;
+      }
+      // 4) saved page data that is missing
+      if (storage.length > 2) {
+        await dl.runJavaScript(
+            "(function(){try{var o=${jsonEncode(storage)};o=JSON.parse(o);for(var k in o){if(localStorage.getItem(k)===null)localStorage.setItem(k,o[k]);}}catch(e){}})()");
+      }
+      if (added > 0) {
+        _dl.log('Download page: copied $added cookie(s) from the main page');
+        await dl.reload();
+      }
+      _dlSessionCopied = true;
+    } catch (e) {
+      _dl.log('Download page: could not copy the session ($e)');
+    }
+  }
+
+  // Frees the hidden page (called when the download list is finished).
+  Future<void> _closeDownloadWeb() async {
+    final c = _dlWeb;
+    _dlWeb = null;
+    _dlSessionCopied = false;
+    if (mounted && _dlWebOn) setState(() => _dlWebOn = false);
+    try {
+      await c?.loadRequest(Uri.parse('about:blank'));
+    } catch (_) {}
+  }
+
+  // The song is not the one the page is playing: open it in the hidden download
+  // page, muted, just long enough for it to ask for the song's audio. The page
+  // the person is using (and the music that plays there) is never touched.
   // Set when the page streams with YouTube's newer mode (requests with "sabr"),
   // which has no plain audio link to take.
   bool _lastPageSabr = false;
@@ -2741,35 +2877,31 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?>
       _openInPageForLink(String vid) async {
     _lastPageSabr = false;
-    final run = audioHandler.runJsResult;
-    // iPhone: WebKit freezes a muted video whose web view is hidden behind
-    // another tab (Download / Sound). Songs that are not playing (library and
-    // playlist downloads) then never ask for their audio and no link shows up.
-    // So the web page is brought to the front while the link is captured, and
-    // the tab the person was on comes back afterwards.
-    final tabBefore = _tab;
-    final showedWeb = Platform.isIOS && mounted && _appTab;
-    if (showedWeb) {
-      setState(() => _tab = _lastWebTab);
-      await Future<void>.delayed(const Duration(milliseconds: 800));
+    final WebViewController web;
+    try {
+      web = await _ensureDownloadWeb();
+    } catch (e) {
+      _dl.log('Could not start the download page ($e)');
+      return null;
     }
+    Future<Object> run(String js) => web.runJavaScriptReturningResult(js);
     Future<String> ask(String js) async {
       try {
-        final r = await run?.call(js);
-        return (r ?? '').toString().replaceAll('"', '');
+        final r = await run(js);
+        return r.toString().replaceAll('"', '');
       } catch (e) {
         return 'error: $e';
       }
     }
 
     try {
-      // 1) let the page finish loading first (right after launch, or on a slow
-      //    VPN, it may still be loading; opening a song now would cut it off)
+      // 1) let the page finish loading first (it may still be loading, or on a
+      //    slow VPN; opening a song now would cut it off)
       final ready = DateTime.now().add(const Duration(seconds: 30));
       var pageReady = false;
       while (DateTime.now().isBefore(ready)) {
         try {
-          await _controller.runJavaScript(WebAudioHandler.gvHookJs);
+          await web.runJavaScript(WebAudioHandler.gvHookJs);
         } catch (_) {}
         final st = await ask(
             "document.readyState+'|'+(window.__gv?'hook':'nohook')+'|'+location.hostname");
@@ -2780,14 +2912,17 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         await Future<void>.delayed(const Duration(milliseconds: 700));
       }
       if (!pageReady) {
-        _dl.log('The YouTube page was not ready after 30 s (${await ask("document.readyState+'|'+location.href.slice(0,60)")})');
+        _dl.log('The download page was not ready after 30 s (${await ask("document.readyState+'|'+location.href.slice(0,60)")})');
       }
       // 2) open the song unless the page is already on it
       final cur = await ask(
           "(function(){try{var p=document.getElementById('movie_player');return p&&p.getVideoData?p.getVideoData().video_id:''}catch(e){return ''}})()");
       if (cur != vid) {
-        await _controller
-            .loadRequest(Uri.parse('https://music.youtube.com/watch?v=$vid'));
+        // forget the link of the previous song
+        try {
+          await web.runJavaScript('if(window.__gv){window.__gv.audio=null;}');
+        } catch (_) {}
+        await web.loadRequest(Uri.parse('https://music.youtube.com/watch?v=$vid'));
       }
       // 3) wait for the page to ask for this song's audio
       var until = DateTime.now().add(const Duration(seconds: 45));
@@ -2796,11 +2931,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       while (DateTime.now().isBefore(until)) {
         await Future<void>.delayed(const Duration(milliseconds: 700));
         try {
-          await _controller.runJavaScript(WebAudioHandler.gvHookJs);
-          await _controller.runJavaScript(
-              "var v=document.querySelector('video');if(v){v.muted=true;if(v.paused){v.play();}}");
+          await web.runJavaScript(WebAudioHandler.gvHookJs);
+          await web.runJavaScript(
+              "var v=document.querySelector('video');if(v){v.muted=true;v.volume=0;if(v.paused){v.play();}}");
         } catch (_) {}
-        final l = await _pageAudioLink(vid, quiet: true);
+        final l = await _pageAudioLink(vid, quiet: true, run: run);
         if (l != null) return l;
         // After ~10 s: is the page only using the newer streaming mode?
         if (DateTime.now().difference(started).inSeconds >= 10) {
@@ -2812,9 +2947,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           if (sabrN >= 2 && plainN == 0) {
             if (!reloaded) {
               reloaded = true;
-              _dl.log('The page is using YouTube\'s new streaming mode. Reloading the page once...');
+              _dl.log('The download page is using YouTube\'s new streaming mode. Reloading it once...');
               try {
-                await _controller.reload();
+                await web.reload();
               } catch (_) {}
               started = DateTime.now();
               until = DateTime.now().add(const Duration(seconds: 40));
@@ -2828,17 +2963,14 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       if (_lastPageSabr) return null;
       var diag = await ask('window.__gvDiag ? window.__gvDiag() : "hook missing"');
       if (diag.length > 700) diag = diag.substring(0, 700);
-      _dl.log('Page report after 45 s: $diag');
+      _dl.log('Download page report after 45 s: $diag');
     } catch (e) {
-      _dl.log('Opening the song in the page failed ($e)');
+      _dl.log('Opening the song in the download page failed ($e)');
     } finally {
       try {
-        await _controller.runJavaScript(
-            "var v=document.querySelector('video');if(v){v.pause();v.muted=false;}");
+        await web.runJavaScript(
+            "var v=document.querySelector('video');if(v){v.pause();}");
       } catch (_) {}
-      if (showedWeb && mounted && _tab == _lastWebTab) {
-        setState(() => _tab = tabBefore);
-      }
     }
     return null;
   }
@@ -4274,6 +4406,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           _dlProgress = null;
         });
       }
+      // The hidden download page is not needed while nothing is downloading
+      // (it stays while the list is only paused).
+      if (_dl.pending.isEmpty) _closeDownloadWeb();
     }
   }
 
@@ -5081,6 +5216,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       await _controller.clearLocalStorage();
       await _controller.clearCache();
       await _controller.loadRequest(Uri.parse('https://music.youtube.com'));
+      await _closeDownloadWeb(); // it signs in again from the fresh session
     };
     audioHandler.runJs = (js) => _controller.runJavaScript(js);
     audioHandler.runJsResult = (js) => _controller.runJavaScriptReturningResult(js);
@@ -5258,6 +5394,19 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         body: SafeArea(
           child: Stack(
             children: [
+              // The hidden download page: far outside the screen, so it cannot
+              // be seen or touched, but WebKit still treats it as alive.
+              if (_dlWebOn && _dlWeb != null)
+                Positioned(
+                  left: -4000,
+                  top: 0,
+                  width: 360,
+                  height: 640,
+                  child: ExcludeSemantics(
+                    child: IgnorePointer(
+                        child: WebViewWidget(controller: _dlWeb!)),
+                  ),
+                ),
               IndexedStack(
                 index: _tab == 3 ? 1 : (_tab == 4 ? 2 : 0),
                 children: [
