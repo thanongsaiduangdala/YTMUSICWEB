@@ -28,3 +28,7 @@
    A song the library cannot read ("video is not available") no longer stops the download before the page link is tried.
 10. Early-press / VPN: before opening a song, wait (up to 30 s) for the YouTube page to finish loading, re-inject the hook while
     waiting, and write a "Page report" into the download log if no link shows up in 45 s.
+11. Some sessions get YouTube's newer streaming mode (requests marked sabr, no plain audio link). The download now detects it,
+    reloads the page once, and if it persists stops with a clear message instead of trying the routes that always return 403.
+12. New button Sound tab > "Reset page session (signs you out)": clears the web page's cookies / storage / cache and reloads it
+    (like a fresh install, without touching downloaded songs). The SABR error message points to it.

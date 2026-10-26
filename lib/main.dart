@@ -549,6 +549,9 @@ class IosFxEngine {
 
 class WebAudioHandler extends BaseAudioHandler {
   /// Set by the page: runs JavaScript inside the webview.
+  /// Set by the page: forgets the website's cookies / storage and reloads it.
+  Future<void> Function()? resetPageSession;
+
   Future<void> Function(String js)? runJs;
   /// Runs JavaScript in the website and returns what it answers.
   Future<Object> Function(String js)? runJsResult;
@@ -2731,8 +2734,13 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   // The song is not the one the page is playing: open it in the page, muted,
   // just long enough for the page to ask for its audio, then pause. (A song
   // that is already playing there is never touched.)
+  // Set when the page streams with YouTube's newer mode (requests with "sabr"),
+  // which has no plain audio link to take.
+  bool _lastPageSabr = false;
+
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?>
       _openInPageForLink(String vid) async {
+    _lastPageSabr = false;
     final run = audioHandler.runJsResult;
     Future<String> ask(String js) async {
       try {
@@ -2771,7 +2779,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             .loadRequest(Uri.parse('https://music.youtube.com/watch?v=$vid'));
       }
       // 3) wait for the page to ask for this song's audio
-      final until = DateTime.now().add(const Duration(seconds: 45));
+      var until = DateTime.now().add(const Duration(seconds: 45));
+      var started = DateTime.now();
+      var reloaded = false;
       while (DateTime.now().isBefore(until)) {
         await Future<void>.delayed(const Duration(milliseconds: 700));
         try {
@@ -2781,7 +2791,30 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         } catch (_) {}
         final l = await _pageAudioLink(vid, quiet: true);
         if (l != null) return l;
+        // After ~10 s: is the page only using the newer streaming mode?
+        if (DateTime.now().difference(started).inSeconds >= 10) {
+          final counts = await ask(
+              "(function(){var l=(window.__gv&&window.__gv.log)||[];var s=0,p=0;l.forEach(function(e){if(e.sabr)s++;else if(e.mime)p++;});return s+'|'+p;})()");
+          final parts = counts.split('|');
+          final sabrN = parts.length == 2 ? (int.tryParse(parts[0]) ?? 0) : 0;
+          final plainN = parts.length == 2 ? (int.tryParse(parts[1]) ?? 0) : 0;
+          if (sabrN >= 2 && plainN == 0) {
+            if (!reloaded) {
+              reloaded = true;
+              _dl.log('The page is using YouTube\'s new streaming mode. Reloading the page once...');
+              try {
+                await _controller.reload();
+              } catch (_) {}
+              started = DateTime.now();
+              until = DateTime.now().add(const Duration(seconds: 40));
+            } else {
+              _lastPageSabr = true;
+              break;
+            }
+          }
+        }
       }
+      if (_lastPageSabr) return null;
       var diag = await ask('window.__gvDiag ? window.__gvDiag() : "hook missing"');
       if (diag.length > 700) diag = diag.substring(0, 700);
       _dl.log('Page report after 45 s: $diag');
@@ -3317,6 +3350,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         }
       } else {
         _dl.log('Could not get a link from the YouTube page for this song');
+        if (_lastPageSabr) {
+          throw Exception(
+              'YouTube is giving this session its new streaming mode, which cannot be downloaded yet. Go to Sound tab > Reset page session, wait for the page to load, play a song and try again.');
+        }
         if (info == null) {
           failure = Exception(
               'Could not get this song. Play it in the Music tab for a few seconds (let any ad finish), then download it again.');
@@ -4865,6 +4902,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _controller.setUserAgent(
           'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1');
     }
+    audioHandler.resetPageSession = () async {
+      await WebViewCookieManager().clearCookies();
+      await _controller.clearLocalStorage();
+      await _controller.clearCache();
+      await _controller.loadRequest(Uri.parse('https://music.youtube.com'));
+    };
     audioHandler.runJs = (js) => _controller.runJavaScript(js);
     audioHandler.runJsResult = (js) => _controller.runJavaScriptReturningResult(js);
     audioHandler.localNext = () async {
@@ -7419,6 +7462,36 @@ class PersonalizeSoundPage extends StatelessWidget {
 
   // Asks the website's script how it is doing and shows the answer, so we can
   // see why the streaming effects do or do not work.
+  Future<void> _resetPageSession(BuildContext context) async {
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Reset page session?'),
+        content: const Text(
+            'This makes the YouTube Music page forget its cookies and saved data, so it starts like a fresh install. You will be signed out of YouTube Music. Your downloaded songs, playlists and settings in this app are not touched.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Reset')),
+        ],
+      ),
+    );
+    if (go != true) return;
+    String msg;
+    try {
+      await audioHandler.resetPageSession?.call();
+      msg = 'Done. Wait for the page to load, play a song, then download.';
+    } catch (e) {
+      msg = 'Could not reset: $e';
+    }
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
   Future<void> _checkDownloadLink(BuildContext context) async {
     String text;
     try {
@@ -7694,6 +7767,11 @@ class PersonalizeSoundPage extends StatelessWidget {
                         onPressed: () => _checkDownloadLink(context),
                         icon: const Icon(Icons.link, size: 18),
                         label: const Text('Check download link'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _resetPageSession(context),
+                        icon: const Icon(Icons.restart_alt, size: 18),
+                        label: const Text('Reset page session (signs you out)'),
                       ),
                       if (audioHandler.eqWorks == false) ...[
                         const SizedBox(height: 10),
