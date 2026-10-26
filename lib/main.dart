@@ -3681,44 +3681,149 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     ));
   }
 
-  // Asks yt-dlp for the list of songs in a playlist / channel page link.
-  // iPhone has no yt-dlp, so the playlist is read with the youtube_explode
-  // library (the same one the iPhone download uses).
   Future<_PlaylistData> _readPlaylistDart(String url) async {
+    final id = Uri.tryParse(url)?.queryParameters['list'] ?? url;
+    var title = '';
+    var songs = <Map<String, String>>[];
     final yt = yt_explode.YoutubeExplode();
     try {
-      final id = Uri.tryParse(url)?.queryParameters['list'] ?? url;
-      var title = '';
       try {
         final p = await yt.playlists.get(id).timeout(const Duration(seconds: 30));
         title = p.title.trim();
       } catch (e) {
         _dl.log('Could not read the playlist name ($e)');
       }
-      final songs = <Map<String, String>>[];
-      final seen = <String>{};
-      var unavailable = 0;
-      await for (final v
-          in yt.playlists.getVideos(id).timeout(const Duration(seconds: 60))) {
-        final vid = v.id.value;
-        final t = v.title.trim();
-        if (vid.length != 11 ||
-            t.isEmpty ||
-            t == '[Private video]' ||
-            t == '[Deleted video]') {
-          unavailable++;
-          continue;
+      try {
+        final seen = <String>{};
+        var unavailable = 0;
+        await for (final v
+            in yt.playlists.getVideos(id).timeout(const Duration(seconds: 60))) {
+          final vid = v.id.value;
+          final t = v.title.trim();
+          if (vid.length != 11 ||
+              t.isEmpty ||
+              t == '[Private video]' ||
+              t == '[Deleted video]') {
+            unavailable++;
+            continue;
+          }
+          if (!seen.add(vid)) continue;
+          songs.add({'id': vid, 'title': t, 'artist': v.author});
         }
-        if (!seen.add(vid)) continue;
-        songs.add({'id': vid, 'title': t, 'artist': v.author});
+        if (unavailable > 0) {
+          _dl.log('Skipping $unavailable private or deleted entries');
+        }
+      } catch (e) {
+        _dl.log('youtube_explode could not list the songs ($e)');
       }
-      if (unavailable > 0) {
-        _dl.log('Skipping $unavailable private or deleted entries');
-      }
-      return _PlaylistData(id, title, songs);
     } finally {
       yt.close();
     }
+    _dl.log('youtube_explode found ${songs.length} songs');
+    if (songs.isEmpty) {
+      songs = await _readPlaylistBrowse(id);
+      _dl.log('Direct YouTube request found ${songs.length} songs');
+    }
+    return _PlaylistData(id, title, songs);
+  }
+
+  String _runsText(dynamic t) {
+    if (t is! Map) return '';
+    final s = t['simpleText'];
+    if (s is String) return s.trim();
+    final runs = t['runs'];
+    if (runs is List) {
+      return runs.map((r) => r is Map ? '${r['text'] ?? ''}' : '').join().trim();
+    }
+    return '';
+  }
+
+  Future<List<Map<String, String>>> _readPlaylistBrowse(String id) async {
+    final songs = <Map<String, String>>[];
+    final seen = <String>{};
+    const version = '2.20250925.01.00';
+    final context = <String, dynamic>{
+      'client': {
+        'clientName': 'WEB',
+        'clientVersion': version,
+        'hl': 'en',
+        'gl': 'US',
+      },
+    };
+    Future<dynamic> post(Map<String, dynamic> body) async {
+      final res = await http
+          .post(
+            Uri.parse('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Origin': 'https://www.youtube.com',
+              'User-Agent':
+                  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
+              'X-YouTube-Client-Name': '1',
+              'X-YouTube-Client-Version': version,
+            },
+            body: jsonEncode(body),
+          )
+          .timeout(const Duration(seconds: 30));
+      if (res.statusCode != 200) {
+        _dl.log('Playlist request: HTTP ${res.statusCode}');
+        return null;
+      }
+      return jsonDecode(utf8.decode(res.bodyBytes));
+    }
+
+    String? token;
+    void walk(dynamic n) {
+      if (n is List) {
+        for (final e in n) {
+          walk(e);
+        }
+        return;
+      }
+      if (n is! Map) return;
+      final r = n['playlistVideoRenderer'];
+      if (r is Map) {
+        final vid = r['videoId'];
+        final t = _runsText(r['title']);
+        if (vid is String &&
+            vid.length == 11 &&
+            t.isNotEmpty &&
+            t != '[Private video]' &&
+            t != '[Deleted video]' &&
+            seen.add(vid)) {
+          songs.add({
+            'id': vid,
+            'title': t,
+            'artist': _runsText(r['shortBylineText']),
+          });
+        }
+        return;
+      }
+      final c = n['continuationItemRenderer'];
+      if (c is Map) {
+        final t = c['continuationEndpoint']?['continuationCommand']?['token'];
+        if (t is String) token = t;
+        return;
+      }
+      for (final v in n.values) {
+        walk(v);
+      }
+    }
+
+    try {
+      var data = await post({'context': context, 'browseId': 'VL$id'});
+      var pages = 0;
+      while (data != null && pages < 200) {
+        token = null;
+        walk(data);
+        pages++;
+        if (token == null) break;
+        data = await post({'context': context, 'continuation': token});
+      }
+    } catch (e) {
+      _dl.log('Direct YouTube request failed ($e)');
+    }
+    return songs;
   }
 
   Future<_PlaylistData> _readPlaylist(String url) async {
