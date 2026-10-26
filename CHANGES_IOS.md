@@ -24,3 +24,5 @@
    audio-only playlist, downloads the parts and joins them (fMP4 -> .m4a, MPEG-TS -> raw AAC .aac). Tried before the old routes.
 8. UMP: the page's audio replies are wrapped in YouTube's "UMP" format. The page-link download now unwraps them (part type 21).
    HLS log lines now show which parts YouTube's iPhone-app reply had.
+9. Songs that are not playing: the download opens the song in the YouTube page (muted, up to 45 s), grabs its link, then pauses.
+   A song the library cannot read ("video is not available") no longer stops the download before the page link is tried.

@@ -2680,7 +2680,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   // playing right now (it already carries YouTube's tokens). Null if the page
   // has not used a plain link for this song, or it is not an AAC / MP4 stream.
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?> _pageAudioLink(
-      String vid) async {
+      String vid,
+      {bool quiet = false}) async {
     try {
       final run = audioHandler.runJsResult;
       if (run == null) return null;
@@ -2690,16 +2691,16 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       if (t.startsWith('"')) t = jsonDecode(t) as String;
       final d = jsonDecode(t);
       if (d is! Map) {
-        _dl.log('The page has not fetched audio for a song yet');
+        if (!quiet) _dl.log('The page has not fetched audio for a song yet');
         return null;
       }
       if ('${d['vid']}' != vid) {
-        _dl.log('The page link is for another song (play this one first)');
+        if (!quiet) _dl.log('The page link is for another song (play this one first)');
         return null;
       }
       final mime = '${d['mime']}';
       if (!mime.contains('mp4')) {
-        _dl.log(
+        if (!quiet) _dl.log(
             'The page is streaming $mime (itag ${d['itag']}), which iPhone cannot play. Skip to the next song and back, then try again');
         return null;
       }
@@ -2725,6 +2726,43 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     } catch (_) {
       return null;
     }
+  }
+
+  // The song is not the one the page is playing: open it in the page, muted,
+  // just long enough for the page to ask for its audio, then pause. (A song
+  // that is already playing there is never touched.)
+  Future<({Uri url, int size, bool post, List<int> body, bool ump})?>
+      _openInPageForLink(String vid) async {
+    try {
+      final run = audioHandler.runJsResult;
+      var cur = '';
+      try {
+        final r = await run?.call(
+            "(function(){try{var p=document.getElementById('movie_player');return p&&p.getVideoData?p.getVideoData().video_id:''}catch(e){return ''}})()");
+        cur = (r ?? '').toString().replaceAll('"', '');
+      } catch (_) {}
+      if (cur != vid) {
+        await _controller
+            .loadRequest(Uri.parse('https://music.youtube.com/watch?v=$vid'));
+      }
+      final until = DateTime.now().add(const Duration(seconds: 45));
+      while (DateTime.now().isBefore(until)) {
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+        try {
+          await _controller.runJavaScript(
+              "var v=document.querySelector('video');if(v){v.muted=true;if(v.paused){v.play();}}");
+        } catch (_) {}
+        final l = await _pageAudioLink(vid, quiet: true);
+        if (l != null) return l;
+      }
+    } catch (_) {
+    } finally {
+      try {
+        await _controller.runJavaScript(
+            "var v=document.querySelector('video');if(v){v.pause();v.muted=false;}");
+      } catch (_) {}
+    }
+    return null;
   }
 
   // HLS: YouTube's iPhone app also gets the song as an HLS playlist (many small
@@ -3020,24 +3058,37 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     IOSink? sink;
     try {
       _dl.log('Asking YouTube for the audio streams...');
-      final manifest = await yt.videos.streamsClient
-          .getManifest(vid)
-          .timeout(const Duration(seconds: 60));
-      check();
-      final aac = manifest.audioOnly
-          .where((s) => s.container == yt_explode.StreamContainer.mp4)
-          .toList()
-        ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
-      if (aac.isEmpty) {
-        throw Exception('YouTube gave no audio stream the iPhone can play');
+      yt_explode.StreamInfo? info;
+      Object? infoError;
+      try {
+        final manifest = await yt.videos.streamsClient
+            .getManifest(vid)
+            .timeout(const Duration(seconds: 60));
+        check();
+        final aac = manifest.audioOnly
+            .where((s) => s.container == yt_explode.StreamContainer.mp4)
+            .toList()
+          ..sort((a, b) => a.bitrate.compareTo(b.bitrate));
+        if (aac.isEmpty) {
+          throw Exception('YouTube gave no audio stream the iPhone can play');
+        }
+        info = _quality == 'small'
+            ? aac.first
+            : (_quality == 'medium' ? aac[aac.length ~/ 2] : aac.last);
+      } catch (e) {
+        check();
+        infoError = e;
+        var why = e.toString().split('\n').first;
+        if (why.length > 90) why = '${why.substring(0, 90)}...';
+        _dl.log('The library could not read this song ($why). Trying the page link...');
       }
-      final info = _quality == 'small'
-          ? aac.first
-          : (_quality == 'medium' ? aac[aac.length ~/ 2] : aac.last);
-      var total = info.size.totalBytes;
-      var link = info.url;
-      _dl.log(
-          'Downloading ${(info.bitrate.kiloBitsPerSecond).round()} kbps AAC (${(total / 1048576).toStringAsFixed(1)} MB)');
+      // Without the library's answer the size comes from the page link.
+      var total = info?.size.totalBytes ?? (1 << 30);
+      var link = info?.url ?? Uri.parse('about:blank');
+      if (info != null) {
+        _dl.log(
+            'Downloading ${(info.bitrate.kiloBitsPerSecond).round()} kbps AAC (${(total / 1048576).toStringAsFixed(1)} MB)');
+      }
       task.status = DlStatus.downloading;
       task.total = total;
       _dl.changed();
@@ -3084,7 +3135,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           }
         }
 
-        sub = yt.videos.streamsClient.get(info).listen((chunk) {
+        sub = yt.videos.streamsClient.get(info!).listen((chunk) {
           lastData = DateTime.now();
           sink!.add(chunk);
           got += chunk.length;
@@ -3207,9 +3258,14 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         }
       }
 
-      Object? failure;
+      Object? failure = infoError;
       // 0) the link the YouTube page itself is using for this song
-      final page = await _pageAudioLink(vid);
+      var page = await _pageAudioLink(vid, quiet: true);
+      if (page == null) {
+        _dl.log('Opening this song in the YouTube page to get its link...');
+        page = await _openInPageForLink(vid);
+        check();
+      }
       if (page != null) {
         _dl.log('Using the audio link from the YouTube page...');
         final keepTotal = total;
@@ -3229,7 +3285,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           await restart();
         }
       } else {
-        _dl.log('No usable link from the YouTube page for this song');
+        _dl.log('Could not get a link from the YouTube page for this song');
+        if (info == null) {
+          failure = Exception(
+              'Could not get this song. Play it in the Music tab for a few seconds (let any ad finish), then download it again.');
+        }
       }
       // 0b) HLS playlist from the iPhone app endpoint (many small parts)
       Future<bool> viaHls() async {
@@ -3325,12 +3385,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         }
       }
       try {
-        if (got < total) await viaLibrary();
+        if (info != null && got < total) await viaLibrary();
       } catch (e) {
         check();
         _dl.log('Direct stream failed ($e). Trying small pieces...');
       }
-      if (got < total) {
+      if (info != null && got < total) {
         try {
           await viaPieces(link, _uaForLink(link), refresh: true);
         } catch (e) {
