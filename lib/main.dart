@@ -4428,7 +4428,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           if (_looksOutdated(err) && !outdatedHint) {
             outdatedHint = true;
             _dl.log(
-                'This looks like YouTube changed something. Try Settings > Check for yt-dlp update.',
+                Platform.isIOS
+                    ? 'This looks like YouTube changed something. Try again later.'
+                    : 'This looks like YouTube changed something. Try Settings > Check for yt-dlp update.',
                 error: true);
           }
           if (err.contains('sign in to confirm') ||
@@ -4484,8 +4486,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _dl.onResume = null;
       }
       if (outdatedHint && mounted) {
-        _toast(
-            'Downloads may be failing because YouTube changed. Try Settings > Check for yt-dlp update.');
+        _toast(Platform.isIOS
+            ? 'Downloads may be failing because YouTube changed. Try again later.'
+            : 'Downloads may be failing because YouTube changed. Try Settings > Check for yt-dlp update.');
       }
       if (saved + failed > 0) {
         final summary = 'Download list: $saved saved, $failed failed'
@@ -6381,8 +6384,11 @@ class SettingsPage extends StatelessWidget {
               _StorageCard(onTap: onStorage),
               const SizedBox(height: 12),
               _BackupCard(onBackup: onBackup, onRestore: onRestore),
-              const SizedBox(height: 12),
-              _YtDlpCard(onCheck: onCheckYtDlp),
+              // iPhone downloads without yt-dlp, so there is nothing to update.
+              if (!Platform.isIOS) ...[
+                const SizedBox(height: 12),
+                _YtDlpCard(onCheck: onCheckYtDlp),
+              ],
             ],
           ),
         ),
@@ -6545,6 +6551,14 @@ class _DownloadSettingsCard extends StatelessWidget {
         '128 kbps: about 1 MB per minute. Roughly half the space of High and fine for most listening.',
   };
 
+  // iPhone: the song is saved as it comes from YouTube (M4A), so the choice
+  // picks the matching audio quality YouTube offers, not an exact bitrate.
+  static const _iosHints = {
+    'high': 'Best quality YouTube offers, biggest files.',
+    'medium': 'A middle choice between size and quality.',
+    'small': 'Smallest files YouTube offers. Fine for most listening.',
+  };
+
   @override
   Widget build(BuildContext context) {
     return Card(
@@ -6564,16 +6578,18 @@ class _DownloadSettingsCard extends StatelessWidget {
               subtitle: const Text(
                   'On mobile data, downloads (including Smart download) wait and carry on by themselves when Wi-Fi is back.'),
             ),
-            const Divider(height: 24),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              value: resetWarm,
-              onChanged: onResetWarm,
-              title: const Text('Reset 15-second wait on page reset',
-                  style: TextStyle(fontWeight: FontWeight.w600)),
-              subtitle: const Text(
-                  'When you reset the page session (Personalize sound), downloads wait for 15 seconds of music or a sign-in again, like on a fresh install. iPhone only.'),
-            ),
+            if (Platform.isIOS) ...[
+              const Divider(height: 24),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: resetWarm,
+                onChanged: onResetWarm,
+                title: const Text('Reset 15-second wait on page reset',
+                    style: TextStyle(fontWeight: FontWeight.w600)),
+                subtitle: const Text(
+                    'When you reset the page session (Personalize sound), downloads wait for 15 seconds of music or a sign-in again, like on a fresh install.'),
+              ),
+            ],
             const Divider(height: 24),
             const Text('Download quality',
                 style: TextStyle(fontWeight: FontWeight.w600)),
@@ -6592,7 +6608,10 @@ class _DownloadSettingsCard extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 8),
-            Text(_hints[quality] ?? '',
+            Text(
+                Platform.isIOS
+                    ? (_iosHints[quality] ?? '')
+                    : (_hints[quality] ?? ''),
                 style: const TextStyle(fontSize: 12, color: Colors.white70)),
             const SizedBox(height: 4),
             const Text(
