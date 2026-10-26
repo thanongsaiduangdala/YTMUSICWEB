@@ -3,40 +3,54 @@ name: iOS-ipa-build
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed to upload the release file
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
 jobs:
   build-ios:
     name: 🎉 iOS Build
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
-          architecture: x64
+          channel: stable
+          cache: true          # keeps Flutter between runs
+
       - run: flutter pub get
-      
 
-      - run: pod repo update
-        working-directory: ios
+      # Shows Dart errors in seconds, before the slow Xcode build.
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib
 
-      - run: flutter build ios --release --no-codesign
+      - name: Build
+        run: >
+          flutter build ios --release --no-codesign
+          --build-number=${{ github.run_number }}
 
-      - run: mkdir Payload
+      - name: Make IPA
+        run: |
+          mkdir Payload
+          cp -R Runner.app Payload/
+          zip -qq -r -9 FlutterIpaExport.ipa Payload
         working-directory: build/ios/iphoneos
 
-      - run: mv Runner.app/ Payload
-        working-directory: build/ios/iphoneos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: build/ios/iphoneos/FlutterIpaExport.ipa
 
-      - name: Zip output
-        run: zip -qq -r -9 FlutterIpaExport.ipa Payload
-        working-directory: build/ios/iphoneos
-
-      - name: Upload binaries to release
+      - name: Upload to release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: build/ios/iphoneos/FlutterIpaExport.ipa
           tag: v1.0
           overwrite: true
-          body: "This is first release"
+          body: "Latest build"
