@@ -17,6 +17,8 @@ import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yt_explode;
 
+import 'backup_zip.dart';
+
 late final WebAudioHandler audioHandler;
 
 Future<void> main() async {
@@ -1285,6 +1287,13 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   Map<String, int> _lastPlayed = {};
   // Setting: only download on Wi-Fi (downloads wait on mobile data).
   bool _wifiOnly = false;
+  // Failed downloads of a playlist: say which ones failed and offer to retry.
+  bool _retryAsk = true; // setting: ask when the list has finished
+  bool _retryAuto = false; // setting: retry by itself, no question
+  final List<_FailedSong> _failedRound = [];
+  bool _retryPromptOpen = false;
+  int _autoRound = 0;
+  static const int _autoRoundsMax = 5;
   // Setting: Reset page session also starts the 15-second download warm-up
   // again (like a fresh install). On by default.
   bool _resetWarmOnSession = true;
@@ -1346,6 +1355,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _smartOn = prefs.getBool('smart_on') ?? false;
       _preferOffline = prefs.getBool('prefer_offline') ?? true;
       _wifiOnly = prefs.getBool('wifi_only') ?? false;
+      _retryAsk = prefs.getBool('retry_ask') ?? true;
+      _retryAuto = prefs.getBool('retry_auto') ?? false;
       _resetWarmOnSession = prefs.getBool('reset_warm_on_session') ?? true;
       final q = prefs.getString('dl_quality') ?? 'high';
       _quality = (q == 'medium' || q == 'small') ? q : 'high';
@@ -1397,6 +1408,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           onQuality: _setQuality,
           resetWarm: _resetWarmOnSession,
           onResetWarm: _setResetWarm,
+          retryAsk: _retryAsk,
+          retryAuto: _retryAuto,
+          onRetryAsk: _setRetryAsk,
+          onRetryAuto: _setRetryAuto,
         ),
         smartCard: () => _SmartDownloadCard(
           on: _smartOn,
@@ -1422,6 +1437,18 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     setState(() => _resetWarmOnSession = on);
     SharedPreferences.getInstance()
         .then((p) => p.setBool('reset_warm_on_session', on));
+    _touch();
+  }
+
+  void _setRetryAsk(bool on) {
+    setState(() => _retryAsk = on);
+    SharedPreferences.getInstance().then((p) => p.setBool('retry_ask', on));
+    _touch();
+  }
+
+  void _setRetryAuto(bool on) {
+    setState(() => _retryAuto = on);
+    SharedPreferences.getInstance().then((p) => p.setBool('retry_auto', on));
     _touch();
   }
 
@@ -1927,6 +1954,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
   // ---- Backup and restore --------------------------------------------------------
   static const String _backupApp = 'ytmusicweb-backup';
+  // Android / iPhone "save as" screen for the finished .zip (native side).
+  static const MethodChannel _backupCh = MethodChannel('ytmusicweb/backup');
 
   Map<String, dynamic> _songRef(LocalSong s) =>
       {'vid': _vidOf(s), 'title': s.title, 'artist': s.artist};
@@ -1936,30 +1965,99 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       .map((m) => Map<String, dynamic>.from(m))
       .toList();
 
+  // The list part of a backup. With [names] (song file -> its name inside the
+  // .zip) every song that has its audio in the backup points to it.
+  Map<String, dynamic> _backupData([Map<String, _ZipNames>? names]) {
+    Map<String, dynamic> ref(LocalSong s) {
+      final m = _songRef(s);
+      final z = names?[s.path];
+      if (z != null) {
+        m['file'] = z.file;
+        if (z.art != null) m['art'] = z.art;
+      }
+      return m;
+    }
+
+    return {
+      'app': _backupApp,
+      'version': names == null ? 1 : 2,
+      'created': DateTime.now().toIso8601String(),
+      'saved': _saved.map((s) => s.toJson()).toList(),
+      'library': _localSongs.map(ref).toList(),
+      'folders': [
+        for (final f in _playlists)
+          {
+            'id': f.id,
+            'name': f.name,
+            'url': f.url,
+            'known': f.known.toList(),
+            'songs': _localSongs.where((s) => f.paths.contains(s.path)).map(ref).toList(),
+          }
+      ],
+    };
+  }
+
   Future<void> _backup() async {
+    final c = await _askBackupOptions();
+    if (c == null || !mounted) return;
+    if (c.audio) {
+      await _backupWithAudio(c);
+    } else {
+      await _backupListOnly();
+    }
+  }
+
+  // "What do you want to back up?" (list only / audio of everything / audio of
+  // some playlists).
+  Future<_BackupChoice?> _askBackupOptions() async {
+    final sizes = <String, int>{};
+    for (final s in _localSongs) {
+      try {
+        sizes[s.path] = await File(s.path).length();
+      } catch (_) {
+        sizes[s.path] = 0;
+      }
+    }
+    int bytesOf(Iterable<LocalSong> l) =>
+        l.fold<int>(0, (a, s) => a + (sizes[s.path] ?? 0));
+    final rows = <_BackupRow>[];
+    for (final f in _playlists) {
+      final l = _songsOfFolder(f);
+      rows.add(_BackupRow(f.id, f.name, l.length, bytesOf(l)));
+    }
+    final loose = _localSongs
+        .where((s) => !_playlists.any((f) => _inFolder(f, s)))
+        .toList();
+    if (!mounted) return null;
+    return showDialog<_BackupChoice>(
+      context: context,
+      builder: (_) => _BackupOptionsDialog(
+        totalSongs: _localSongs.length,
+        totalBytes: bytesOf(_localSongs),
+        rows: rows,
+        looseSongs: loose.length,
+        looseBytes: bytesOf(loose),
+      ),
+    );
+  }
+
+  // The songs whose audio goes into the backup.
+  List<LocalSong> _backupSongs(_BackupChoice c) {
+    if (c.all) return List.of(_localSongs);
+    final out = <LocalSong>[];
+    for (final s in _localSongs) {
+      final inChosen = _playlists
+          .any((f) => c.folderIds.contains(f.id) && _inFolder(f, s));
+      final inAny = _playlists.any((f) => _inFolder(f, s));
+      if (inChosen || (c.loose && !inAny)) out.add(s);
+    }
+    return out;
+  }
+
+  Future<void> _backupListOnly() async {
     try {
-      final data = {
-        'app': _backupApp,
-        'version': 1,
-        'created': DateTime.now().toIso8601String(),
-        'saved': _saved.map((s) => s.toJson()).toList(),
-        'library': _localSongs.map(_songRef).toList(),
-        'folders': [
-          for (final f in _playlists)
-            {
-              'id': f.id,
-              'name': f.name,
-              'url': f.url,
-              'known': f.known.toList(),
-              'songs': _localSongs
-                  .where((s) => f.paths.contains(s.path))
-                  .map(_songRef)
-                  .toList(),
-            }
-        ],
-      };
       final bytes = Uint8List.fromList(
-          utf8.encode(const JsonEncoder.withIndent(' ').convert(data)));
+          utf8.encode(const JsonEncoder.withIndent(' ').convert(_backupData())));
       final day = DateTime.now().toIso8601String().substring(0, 10);
       final where = await FilePicker.saveFile(
         dialogTitle: 'Save backup',
@@ -1974,37 +2072,338 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
+  // Shows a progress box that cannot be swiped away. Returns the function that
+  // closes it again (safe to call more than once).
+  VoidCallback _openProgress(
+      String title, ValueNotifier<_Prog> prog, VoidCallback onCancel) {
+    var open = true;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) =>
+          _ProgressDialog(title: title, progress: prog, onCancel: onCancel),
+    );
+    return () {
+      if (open && mounted) {
+        open = false;
+        Navigator.of(context, rootNavigator: true).pop();
+      }
+    };
+  }
+
+  // One .zip: backup.json (the list) + music/<audio files>. Built in the app's
+  // temporary folder piece by piece (big libraries do not need the memory),
+  // then handed to the system "save" screen.
+  Future<void> _backupWithAudio(_BackupChoice c) async {
+    final jobs = <_AudioJob>[];
+    final used = <String>{};
+    var total = 0;
+    for (final s in _backupSongs(c)) {
+      int len;
+      try {
+        final f = File(s.path);
+        if (!await f.exists()) continue;
+        len = await f.length();
+      } catch (_) {
+        continue;
+      }
+      if (len == 0) continue;
+      final base =
+          s.path.split('/').last.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      var name = 'music/$base';
+      var n = 1;
+      while (!used.add(name)) {
+        name = 'music/${n++}_$base';
+      }
+      String? art;
+      if (s.art.isNotEmpty) {
+        try {
+          if (await File(s.art).exists()) art = '$name.jpg';
+        } catch (_) {}
+      }
+      jobs.add(_AudioJob(s, name, art, len));
+      total += len;
+    }
+    if (jobs.isEmpty) {
+      _toast('None of the chosen songs has an audio file on this phone');
+      return;
+    }
+    if (!mounted) return;
+
+    var cancelled = false;
+    final prog = ValueNotifier<_Prog>(const _Prog('Getting ready...', null));
+    final closeProgress = _openProgress('Backing up audio', prog, () {
+      cancelled = true;
+      prog.value = const _Prog('Cancelling...', null);
+    });
+
+    String? zipPath;
+    ZipWriter? zw;
+    try {
+      final tmp = await getTemporaryDirectory();
+      final day = DateTime.now().toIso8601String().substring(0, 10);
+      zipPath = '${tmp.path}/ytmusic-backup-$day.zip';
+      try {
+        await File(zipPath).delete();
+      } catch (_) {}
+      zw = await ZipWriter.create(zipPath);
+
+      final names = <String, _ZipNames>{};
+      var done = 0, added = 0, failed = 0, addedBytes = 0;
+      var shown = 0.0;
+      for (final j in jobs) {
+        if (cancelled) break;
+        final label =
+            '${added + failed + 1} of ${jobs.length}\n${j.song.title.isEmpty ? j.name : j.song.title}';
+        prog.value = _Prog(label, math.min(1.0, done / total));
+        try {
+          await zw.addFile(j.name, File(j.song.path), onBytes: (n) {
+            done += n;
+            final f = math.min(1.0, done / total);
+            if (f - shown >= 0.005) {
+              shown = f;
+              prog.value = _Prog(label, f);
+            }
+          });
+          String? artName;
+          if (j.art != null) {
+            try {
+              await zw.addFile(j.art!, File(j.song.art));
+              artName = j.art;
+            } catch (_) {}
+          }
+          names[j.song.path] = _ZipNames(j.name, artName);
+          added++;
+          addedBytes += j.size;
+        } catch (_) {
+          failed++;
+        }
+      }
+      if (cancelled) {
+        _toast('Backup cancelled');
+        return;
+      }
+      if (added == 0) {
+        _toast('Could not read any of the audio files');
+        return;
+      }
+      await zw.addBytes(
+          'backup.json',
+          utf8.encode(
+              const JsonEncoder.withIndent(' ').convert(_backupData(names))));
+      await zw.close();
+      zw = null;
+
+      prog.value = const _Prog('Choose where to save the backup...', null);
+      bool saved;
+      try {
+        saved = (await _backupCh.invokeMethod<bool>('exportFile', {
+              'path': zipPath,
+            })) ??
+            false;
+      } on MissingPluginException {
+        // No "save as" screen on this platform: keep the file in the app's
+        // folder instead.
+        final docs = await getApplicationDocumentsDirectory();
+        final dir = Directory('${docs.path}/Backups');
+        await dir.create(recursive: true);
+        final dest = '${dir.path}/${zipPath.split('/').last}';
+        await File(zipPath).copy(dest);
+        _toast('Backup saved to $dest');
+        return;
+      }
+      if (!saved) {
+        _toast('Backup not saved');
+        return;
+      }
+      _toast('Backup saved: ${_songsText(added)} with audio (${_fmtBytes(addedBytes)})'
+          '${failed > 0 ? ', $failed could not be read' : ''}');
+    } on FileSystemException catch (e) {
+      final full = (e.osError?.errorCode == 28) ||
+          e.message.toLowerCase().contains('space');
+      _toast(full
+          ? 'Not enough free space on this phone to build the backup'
+          : 'Could not build the backup: ${e.message}');
+    } catch (e) {
+      _toast('Could not save the backup: $e');
+    } finally {
+      await zw?.abort();
+      closeProgress();
+      if (zipPath != null) {
+        try {
+          await File(zipPath).delete();
+        } catch (_) {}
+      }
+    }
+  }
+
   Future<void> _restore() async {
     Map<String, dynamic> data;
+    ZipReader? zip;
+    String? pickedPath;
     try {
       final files = await FilePicker.pickFiles(type: FileType.any);
       if (files.isEmpty) return;
-      final j = jsonDecode(utf8.decode(await files.first.readAsBytes()));
+      pickedPath = files.first.path;
+      Object? j;
+      if (pickedPath != null && await looksLikeZip(pickedPath)) {
+        zip = await ZipReader.open(pickedPath);
+        final m = zip.find('backup.json');
+        if (m == null) throw const FormatException();
+        j = jsonDecode(utf8.decode(await zip.readBytes(m)));
+      } else {
+        j = jsonDecode(utf8.decode(await files.first.readAsBytes()));
+      }
       if (j is! Map || j['app'] != _backupApp) throw const FormatException();
       data = Map<String, dynamic>.from(j);
     } catch (_) {
+      await zip?.close();
       _toast('That is not a backup file made by this app');
       return;
     }
+    try {
+      await _restoreData(data, zip);
+    } finally {
+      await zip?.close();
+      // The file picker keeps its own copy of a big file in the cache.
+      try {
+        final tmp = await getTemporaryDirectory();
+        if (pickedPath != null && pickedPath.startsWith(tmp.path)) {
+          await File(pickedPath).delete();
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Takes the audio of a backup .zip out into the music folder and adds the
+  // songs to the library. Returns [restored, failed].
+  Future<List<int>> _extractZipSongs(
+      ZipReader zip, List<_ZipSong> items) async {
+    var cancelled = false;
+    final prog = ValueNotifier<_Prog>(const _Prog('Getting ready...', null));
+    final closeProgress = _openProgress('Restoring audio', prog, () {
+      cancelled = true;
+      prog.value = const _Prog('Cancelling...', null);
+    });
+    var ok = 0, bad = 0, done = 0, total = 0;
+    for (final z in items) {
+      total += zip.find(z.file)?.size ?? 0;
+    }
+    final added = <LocalSong>[];
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/music');
+      await dir.create(recursive: true);
+      var shown = 0.0;
+      var i = 0;
+      for (final z in items) {
+        if (cancelled) break;
+        i++;
+        final entry = zip.find(z.file);
+        final ext = z.file.contains('.')
+            ? z.file.substring(z.file.lastIndexOf('.') + 1).toLowerCase()
+            : '';
+        if (entry == null || !_audioExts.contains(ext)) {
+          bad++;
+          continue;
+        }
+        final label =
+            '$i of ${items.length}\n${z.title.isEmpty ? z.file : z.title}';
+        prog.value = _Prog(label, total == 0 ? null : math.min(1.0, done / total));
+        // Only the file's own name is used (never a path from the zip), and
+        // only safe characters.
+        final base = z.file
+            .split('/')
+            .last
+            .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        var dest = '${dir.path}/$base';
+        if (File(dest).existsSync()) {
+          // A different file already has this name: new time stamp, same id.
+          final m = RegExp(r'^\d+_(.+)$').firstMatch(base);
+          final stamp = DateTime.now().millisecondsSinceEpoch + i;
+          dest = '${dir.path}/${stamp}_${m != null ? m.group(1) : base}';
+        }
+        try {
+          await zip.extractTo(entry, dest, onBytes: (n) {
+            done += n;
+            final f = total == 0 ? 0.0 : math.min(1.0, done / total);
+            if (f - shown >= 0.005) {
+              shown = f;
+              prog.value = _Prog(label, f);
+            }
+          });
+        } catch (_) {
+          bad++;
+          continue;
+        }
+        var artPath = '';
+        if (z.art.isNotEmpty) {
+          final ae = zip.find(z.art);
+          if (ae != null) {
+            try {
+              await zip.extractTo(ae, '$dest.jpg');
+              artPath = '$dest.jpg';
+            } catch (_) {}
+          }
+        }
+        var title = z.title;
+        var artist = z.artist;
+        try {
+          final md = readMetadata(File(dest), getImage: artPath.isEmpty);
+          if (title.isEmpty) title = (md.title ?? '').trim();
+          if (artist.isEmpty) artist = (md.artist ?? '').trim();
+          if (artPath.isEmpty && md.pictures.isNotEmpty) {
+            await File('$dest.jpg').writeAsBytes(md.pictures.first.bytes);
+            artPath = '$dest.jpg';
+          }
+        } catch (_) {}
+        if (title.isEmpty) {
+          title = base.replaceAll(RegExp(r'\.[A-Za-z0-9]+$'), '');
+        }
+        added.add(
+            LocalSong(title: title, artist: artist, path: dest, art: artPath));
+        ok++;
+      }
+    } catch (_) {
+      // what was copied so far is kept
+    } finally {
+      closeProgress();
+    }
+    if (added.isNotEmpty && mounted) {
+      setState(() => _localSongs = [..._localSongs, ...added]);
+      await _persistLocal();
+    }
+    return [ok, bad];
+  }
+
+  Future<void> _restoreData(Map<String, dynamic> data, ZipReader? zip) async {
     if (!mounted) return;
 
     final savedIn = _maps(data['saved']).map(SavedSong.fromJson).toList();
     final libraryIn = _maps(data['library']);
     final foldersIn = _maps(data['folders']);
 
-    // Songs of the backup that are not on this phone (and can be downloaded
-    // again, which needs a video id). Folder songs first, so they keep their
-    // folder when the list skips duplicates.
+    // Songs of the backup that are not on this phone: the ones whose audio is
+    // inside the .zip, and the ones that can be downloaded again (they need a
+    // video id). Folder songs first, so they keep their folder when the list
+    // skips duplicates.
     final missing = <PendingSong>[];
+    final zipSongs = <_ZipSong>[];
     final seen = <String>{};
+    final zipSeen = <String>{};
     var noLink = 0;
     void check(Map<String, dynamic> m, String? folderId) {
       final vid = (m['vid'] as String?) ?? '';
       final title = (m['title'] as String?) ?? '';
       final artist = (m['artist'] as String?) ?? '';
       if (_findLocal(vid, title, artist) >= 0) return;
+      final file = (m['file'] as String?) ?? '';
+      final inZip = zip != null && file.isNotEmpty && zip.find(file) != null;
+      if (inZip && zipSeen.add(vid.isNotEmpty ? vid : 't:$title|$artist')) {
+        zipSongs.add(_ZipSong(vid, title, artist, file, (m['art'] as String?) ?? ''));
+      }
       if (vid.isEmpty) {
-        noLink++;
+        if (!inZip) noLink++;
         return;
       }
       if (seen.add(vid)) missing.add(PendingSong(vid, title, artist, folderId));
@@ -2020,17 +2419,27 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       check(m, null);
     }
 
+    final zipVids =
+        zipSongs.map((z) => z.vid).where((v) => v.isNotEmpty).toSet();
+    final leftover = missing.where((p) => !zipVids.contains(p.vid)).toList();
+    final hasAudio = zipSongs.isNotEmpty;
+    final audioBytes =
+        zipSongs.fold<int>(0, (a, z) => a + (zip?.find(z.file)?.size ?? 0));
+
     final when = DateTime.tryParse((data['created'] as String?) ?? '');
     final ask = await showDialog<int>(
       context: context,
       builder: (c) => AlertDialog(
         title: const Text('Restore this backup?'),
-        content: Text(
-            '${when == null ? '' : 'Made on ${when.toIso8601String().substring(0, 10)}.\n'}'
-            'It has ${_songsText(libraryIn.length)}, ${foldersIn.length} folder(s) and ${savedIn.length} saved link(s).\n\n'
-            '${missing.isEmpty ? 'All its songs are already on this phone.' : '${_songsText(missing.length)} are not on this phone.'}'
-            '${noLink > 0 ? '\n$noLink added by hand cannot be downloaded again.' : ''}\n\n'
-            'Nothing is deleted: the backup is added to what you have now.'),
+        content: SingleChildScrollView(
+          child: Text(
+              '${when == null ? '' : 'Made on ${when.toIso8601String().substring(0, 10)}.\n'}'
+              'It has ${_songsText(libraryIn.length)}, ${foldersIn.length} folder(s) and ${savedIn.length} saved link(s).\n\n'
+              '${hasAudio ? '${_songsText(zipSongs.length)} with audio in this backup are not on this phone (${_fmtBytes(audioBytes)}).' : (missing.isEmpty ? 'All its songs are already on this phone.' : '${_songsText(missing.length)} are not on this phone.')}'
+              '${hasAudio && leftover.isNotEmpty ? '\n${_songsText(leftover.length)} more are in the list but their audio is not in this backup.' : ''}'
+              '${noLink > 0 ? '\n$noLink added by hand cannot be downloaded again.' : ''}\n\n'
+              'Nothing is deleted: the backup is added to what you have now.'),
+        ),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(c, 0),
@@ -2038,14 +2447,32 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           TextButton(
               onPressed: () => Navigator.pop(c, 1),
               child: const Text('Restore list')),
-          if (missing.isNotEmpty)
+          if (!hasAudio && missing.isNotEmpty)
             TextButton(
                 onPressed: () => Navigator.pop(c, 2),
                 child: Text('Restore + download ${missing.length}')),
+          if (hasAudio)
+            TextButton(
+                onPressed: () => Navigator.pop(c, 3),
+                child: Text('Restore + ${zipSongs.length} audio')),
+          if (hasAudio && leftover.isNotEmpty)
+            TextButton(
+                onPressed: () => Navigator.pop(c, 4),
+                child: Text(
+                    'Audio + download ${leftover.length} more')),
         ],
       ),
     );
     if (ask == null || ask == 0 || !mounted) return;
+
+    // Audio files from the .zip go in first, so the folders below find them.
+    var audioDone = 0, audioFailed = 0;
+    if ((ask == 3 || ask == 4) && zip != null) {
+      final r = await _extractZipSongs(zip, zipSongs);
+      audioDone = r[0];
+      audioFailed = r[1];
+      if (!mounted) return;
+    }
 
     // Saved links
     final newSaved = savedIn.where((s) => !_saved.any((x) => s.vid.isNotEmpty
@@ -2096,8 +2523,15 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     await _persistPlaylists();
     if (mounted) setState(() {});
     var queued = 0;
-    if (ask == 2) queued = _enqueue(fixed);
+    final List<PendingSong> toDownload = ask == 2
+        ? fixed
+        : ask == 4
+            ? fixed.where((p) => !zipVids.contains(p.vid)).toList()
+            : const <PendingSong>[];
+    if (toDownload.isNotEmpty) queued = _enqueue(toDownload);
     _toast('Restored: ${newSaved.length} saved link(s), $created new folder(s)'
+        '${audioDone > 0 ? ', ${_songsText(audioDone)} with audio' : ''}'
+        '${audioFailed > 0 ? ' ($audioFailed audio could not be restored)' : ''}'
         '${queued > 0 ? ', downloading $queued song(s)' : ''}');
   }
 
@@ -4298,6 +4732,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _dl.onCancelCurrent = _cancelCurrent;
     var saved = 0, failed = 0, strikes = 0, n = 0;
     var pausedReason = '';
+    var wasStopped = false;
     var waitKind = '';
     var outdatedHint = false;
     try {
@@ -4380,6 +4815,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           _retries.remove(s.vid);
           _resumeIds.remove(s.vid);
           _linkToFolder(s);
+          _failedRound.removeWhere((f) => f.song.vid == s.vid);
           if (s.smart) {
             _toast('Smart download: saved "${s.title}"');
           } else if (s.folderId == null) {
@@ -4425,6 +4861,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           if (doomed != null) _dropPartials(doomed);
           failed++;
           strikes++;
+          if (s.folderId != null && !s.smart) {
+            _failedRound.removeWhere((f) => f.song.vid == s.vid);
+            _failedRound.add(_FailedSong(s, (t.why ?? t.error ?? 'Unknown error')));
+          }
           if (_looksOutdated(err) && !outdatedHint) {
             outdatedHint = true;
             _dl.log(
@@ -4473,6 +4913,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _resumeIds.clear();
       }
       final stopped = _batchCancel;
+      wasStopped = stopped;
       _batchCancel = false;
       if (pausedReason.isNotEmpty && _dl.pending.isNotEmpty && mounted) {
         _dl.batchStatus = 'Paused: $pausedReason';
@@ -4512,6 +4953,151 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       // The hidden download page is not needed while nothing is downloading
       // (it stays while the list is only paused).
       if (_dl.pending.isEmpty) _closeDownloadWeb();
+    }
+    // Everything has been tried: report what failed.
+    if (!wasStopped && mounted && _dl.pending.isEmpty) {
+      await _afterQueue(pausedReason.isNotEmpty);
+    }
+  }
+
+  // The list is empty. If playlist songs failed: retry them by themselves
+  // (setting) or list them and ask.
+  Future<void> _afterQueue(bool limited) async {
+    // Songs that arrived some other way in the meantime are not failures.
+    _failedRound.removeWhere(
+        (f) => _alreadyHave(f.song.vid, f.song.title, f.song.artist));
+    if (_failedRound.isEmpty) {
+      _autoRound = 0;
+      return;
+    }
+    if (_retryPromptOpen) return;
+    // Automatic retries (not while YouTube is limiting this connection).
+    if (_retryAuto && !limited && _autoRound < _autoRoundsMax) {
+      _autoRound++;
+      final list = _failedRound.map((f) => f.song).toList();
+      _toast(
+          'Retrying ${list.length} failed song(s) in 15 s (try $_autoRound of $_autoRoundsMax)');
+      _dl.log('Automatic retry $_autoRound of $_autoRoundsMax: ${list.length} song(s)');
+      await Future.delayed(const Duration(seconds: 15));
+      if (!mounted || _queueRunning || _dl.pending.isNotEmpty) return;
+      _failedRound.clear();
+      _enqueue(list);
+      return;
+    }
+    final gaveUp = _retryAuto && !limited;
+    if (!_retryAsk && !gaveUp) {
+      // The person turned the question off: only keep a note in the log.
+      for (final f in _failedRound) {
+        _dl.log('Failed: "${f.song.title}" (${f.reason})', error: true);
+      }
+      _failedRound.clear();
+      return;
+    }
+    await _askRetryFailed(gaveUp: gaveUp, limited: limited);
+  }
+
+  Future<void> _askRetryFailed(
+      {required bool gaveUp, required bool limited}) async {
+    _retryPromptOpen = true;
+    var always = false;
+    try {
+      final shown = List<_FailedSong>.of(_failedRound);
+      final res = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setD) => AlertDialog(
+            backgroundColor: const Color(0xFF1A1A1A),
+            title: Text('${shown.length} song(s) did not download'),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (gaveUp)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 8),
+                      child: Text(
+                          'They still failed after the automatic tries.',
+                          style: TextStyle(fontSize: 12, color: Colors.white70)),
+                    ),
+                  if (limited)
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 8),
+                      child: Text(
+                          'YouTube seems to be limiting this connection, so waiting a while before trying again helps.',
+                          style: TextStyle(fontSize: 12, color: Colors.white70)),
+                    ),
+                  Flexible(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                          maxHeight: MediaQuery.of(ctx).size.height * 0.4),
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: [
+                          for (final f in shown)
+                            ListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(Icons.error_outline,
+                                  size: 20, color: Colors.redAccent),
+                              title: Text(f.song.title,
+                                  maxLines: 2, overflow: TextOverflow.ellipsis),
+                              subtitle: Text(
+                                  [
+                                    if (f.song.artist.isNotEmpty) f.song.artist,
+                                    f.reason,
+                                  ].join(' · '),
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  if (!gaveUp)
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      value: always,
+                      onChanged: (v) => setD(() => always = v ?? false),
+                      title: const Text(
+                          'Do not ask again: retry automatically until everything is downloaded',
+                          style: TextStyle(fontSize: 13)),
+                      subtitle: const Text(
+                          'You can change this in Settings.',
+                          style: TextStyle(fontSize: 11)),
+                    ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('Not now')),
+              FilledButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: Text('Download again (${shown.length})')),
+            ],
+          ),
+        ),
+      );
+      if (res == true) {
+        if (always) _setRetryAuto(true);
+        _autoRound = 0;
+        final list = _failedRound.map((f) => f.song).toList();
+        _failedRound.clear();
+        _enqueue(list);
+      } else {
+        for (final f in _failedRound) {
+          _dl.log('Failed: "${f.song.title}" (${f.reason})', error: true);
+        }
+        _failedRound.clear();
+        _autoRound = 0;
+      }
+    } finally {
+      _retryPromptOpen = false;
     }
   }
 
@@ -4704,8 +5290,13 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       context: context,
       builder: (ctx) => _SongPickDialog(
         playlistName: target?.name ?? pl.title,
-        total: songs.length,
-        songs: todo,
+        songs: songs,
+        downloaded: {
+          for (var i = 0; i < songs.length; i++)
+            if (_alreadyHave(
+                songs[i]['id']!, songs[i]['title']!, songs[i]['artist'] ?? ''))
+              i
+        },
         removedBefore: removedBefore,
       ),
     );
@@ -5757,18 +6348,19 @@ class LogLine {
   const LogLine(this.time, this.text, this.error);
 }
 
-/// Lists the songs of a playlist that are not on the device yet; the person
-/// ticks the ones to download (or taps Select all).
+/// Lists every song of a playlist, marks the ones already on the device, and
+/// lets the person tick what to download (or tap "Not downloaded" to tick only
+/// the missing ones, or "All").
 class _SongPickDialog extends StatefulWidget {
   final String playlistName;
-  final int total;
   final List<Map<String, String>> songs;
+  final Set<int> downloaded; // indexes in [songs] that are on the device
   final Set<String> removedBefore;
 
   const _SongPickDialog({
     required this.playlistName,
-    required this.total,
     required this.songs,
+    required this.downloaded,
     required this.removedBefore,
   });
 
@@ -5779,13 +6371,21 @@ class _SongPickDialog extends StatefulWidget {
 class _SongPickDialogState extends State<_SongPickDialog> {
   final Set<int> _on = {};
 
-  bool get _all => _on.length == widget.songs.length;
+  Set<int> get _missing => {
+        for (var i = 0; i < widget.songs.length; i++)
+          if (!widget.downloaded.contains(i)) i
+      };
 
   @override
   Widget build(BuildContext context) {
     final n = _on.length;
     final minutes = (n * 25 / 60).ceil();
-    final onDevice = widget.total - widget.songs.length;
+    final have = widget.downloaded.length;
+    final missing = widget.songs.length - have;
+    final onlyMissing = _on.length == missing &&
+        missing > 0 &&
+        _on.every((i) => !widget.downloaded.contains(i));
+    final allOn = _on.length == widget.songs.length;
     final h = MediaQuery.of(context).size.height;
     return AlertDialog(
       backgroundColor: const Color(0xFF1A1A1A),
@@ -5796,22 +6396,38 @@ class _SongPickDialogState extends State<_SongPickDialog> {
       contentPadding: const EdgeInsets.fromLTRB(8, 12, 8, 0),
       content: SizedBox(
         width: double.maxFinite,
-        height: h * 0.55,
+        height: h * 0.6,
         child: Column(
           children: [
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                    '${widget.songs.length} songs · $have downloaded · $missing not downloaded',
+                    style: const TextStyle(fontSize: 12)),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Wrap(
+                spacing: 4,
                 children: [
-                  Expanded(
-                    child: Text(
-                        '${widget.songs.length} songs to choose from'
-                        '${onDevice > 0 ? ' ($onDevice already on this device)' : ''}',
-                        style: const TextStyle(fontSize: 12)),
+                  TextButton(
+                    onPressed: missing == 0
+                        ? null
+                        : () => setState(() {
+                              _on
+                                ..clear()
+                                ..addAll(_missing);
+                            }),
+                    child: Text(onlyMissing
+                        ? 'Not downloaded ✓'
+                        : 'Select not downloaded ($missing)'),
                   ),
                   TextButton(
                     onPressed: () => setState(() {
-                      if (_all) {
+                      if (allOn) {
                         _on.clear();
                       } else {
                         _on
@@ -5820,8 +6436,13 @@ class _SongPickDialogState extends State<_SongPickDialog> {
                               widget.songs.length, (i) => i));
                       }
                     }),
-                    child: Text(_all ? 'Clear' : 'Select all'),
+                    child: Text(allOn ? 'Clear' : 'Select all'),
                   ),
+                  if (n > 0 && !allOn)
+                    TextButton(
+                      onPressed: () => setState(_on.clear),
+                      child: const Text('Clear'),
+                    ),
                 ],
               ),
             ),
@@ -5833,6 +6454,7 @@ class _SongPickDialogState extends State<_SongPickDialog> {
                   final song = widget.songs[i];
                   final artist = song['artist'] ?? '';
                   final removed = widget.removedBefore.contains(song['id']);
+                  final isHave = widget.downloaded.contains(i);
                   return CheckboxListTile(
                     dense: true,
                     value: _on.contains(i),
@@ -5843,11 +6465,19 @@ class _SongPickDialogState extends State<_SongPickDialog> {
                         _on.remove(i);
                       }
                     }),
+                    secondary: Icon(
+                        isHave ? Icons.check_circle : Icons.circle_outlined,
+                        size: 20,
+                        color: isHave ? Colors.greenAccent : Colors.white38),
                     title: Text(song['title'] ?? '',
-                        maxLines: 2, overflow: TextOverflow.ellipsis),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: isHave ? Colors.white60 : null)),
                     subtitle: Text(
                         [
                           if (artist.isNotEmpty) artist,
+                          if (isHave) 'Downloaded',
                           if (removed) 'removed earlier',
                         ].join(' · '),
                         maxLines: 1,
@@ -6534,8 +7164,14 @@ class _DownloadSettingsCard extends StatelessWidget {
   final ValueChanged<String> onQuality;
   final bool resetWarm;
   final ValueChanged<bool> onResetWarm;
+  final bool retryAsk, retryAuto;
+  final ValueChanged<bool> onRetryAsk, onRetryAuto;
 
   const _DownloadSettingsCard({
+    required this.retryAsk,
+    required this.retryAuto,
+    required this.onRetryAsk,
+    required this.onRetryAuto,
     required this.wifiOnly,
     required this.quality,
     required this.onWifiOnly,
@@ -6591,6 +7227,25 @@ class _DownloadSettingsCard extends StatelessWidget {
               ),
             ],
             const Divider(height: 24),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: retryAsk,
+              onChanged: onRetryAsk,
+              title: const Text('Ask about failed songs',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text(
+                  'When a playlist download has finished, list the songs that failed and ask if you want to download them again.'),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: retryAuto,
+              onChanged: onRetryAuto,
+              title: const Text('Retry failed songs automatically',
+                  style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text(
+                  'No question: failed songs are downloaded again by themselves until everything is saved (up to 5 tries, then you are asked).'),
+            ),
+            const Divider(height: 24),
             const Text('Download quality',
                 style: TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 10),
@@ -6642,7 +7297,7 @@ class _BackupCard extends StatelessWidget {
                 style: TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 4),
             const Text(
-                'Saves your song list, saved links and playlist folders to a file, so a reinstall does not lose how they are organised. The music files themselves are not in the backup: after a restore, songs missing from the phone can be downloaded again.',
+                'Saves your song list, saved links and playlist folders to a file, so a reinstall does not lose how they are organised. You can also include the music files themselves (all songs, or only some playlists) in one .zip; without them, songs missing after a restore can be downloaded again.',
                 style: TextStyle(fontSize: 12, color: Colors.white70)),
             const SizedBox(height: 12),
             Row(
@@ -8997,4 +9652,230 @@ class _SeekBarState extends State<_SeekBar> {
       );
     });
   }
+}
+
+// ---- Audio backup: small helper types and dialogs -------------------------------
+
+/// What the person chose in the "Back up" box.
+class _BackupChoice {
+  final bool audio; // include the music files
+  final bool all; // all songs (otherwise only the chosen playlists)
+  final Set<String> folderIds;
+  final bool loose; // songs that are in no playlist
+  const _BackupChoice(
+      {required this.audio,
+      required this.all,
+      required this.folderIds,
+      required this.loose});
+}
+
+class _BackupRow {
+  final String id, name;
+  final int songs, bytes;
+  const _BackupRow(this.id, this.name, this.songs, this.bytes);
+}
+
+class _AudioJob {
+  final LocalSong song;
+  final String name; // inside the .zip
+  final String? art; // cover image inside the .zip
+  final int size;
+  const _AudioJob(this.song, this.name, this.art, this.size);
+}
+
+class _ZipNames {
+  final String file;
+  final String? art;
+  const _ZipNames(this.file, this.art);
+}
+
+class _ZipSong {
+  final String vid, title, artist, file, art;
+  const _ZipSong(this.vid, this.title, this.artist, this.file, this.art);
+}
+
+class _Prog {
+  final String text;
+  final double? value; // null = no percentage known
+  const _Prog(this.text, this.value);
+}
+
+class _ProgressDialog extends StatelessWidget {
+  final String title;
+  final ValueListenable<_Prog> progress;
+  final VoidCallback onCancel;
+  const _ProgressDialog(
+      {required this.title, required this.progress, required this.onCancel});
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: Text(title),
+        content: ValueListenableBuilder<_Prog>(
+          valueListenable: progress,
+          builder: (context, p, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(p.text, maxLines: 3, overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 14),
+              LinearProgressIndicator(value: p.value),
+              if (p.value != null) ...[
+                const SizedBox(height: 6),
+                Text('${(p.value! * 100).round()}%',
+                    style: const TextStyle(fontSize: 12, color: Colors.white70)),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: onCancel, child: const Text('Cancel')),
+        ],
+      ),
+    );
+  }
+}
+
+/// "Back up": song list only, or the song list plus the audio files (all of
+/// them, or those of the playlists that are ticked).
+class _BackupOptionsDialog extends StatefulWidget {
+  final int totalSongs, totalBytes, looseSongs, looseBytes;
+  final List<_BackupRow> rows;
+  const _BackupOptionsDialog({
+    required this.totalSongs,
+    required this.totalBytes,
+    required this.rows,
+    required this.looseSongs,
+    required this.looseBytes,
+  });
+
+  @override
+  State<_BackupOptionsDialog> createState() => _BackupOptionsDialogState();
+}
+
+class _BackupOptionsDialogState extends State<_BackupOptionsDialog> {
+  bool _audio = false;
+  bool _all = true;
+  bool _loose = false;
+  final Set<String> _ids = {};
+
+  bool get _valid => !_audio || _all || _ids.isNotEmpty || _loose;
+
+  Widget _option(bool selected, String title, String? sub, VoidCallback onTap,
+      {double indent = 0}) {
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.only(left: indent),
+      leading: Icon(
+          selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+          color: selected ? Theme.of(context).colorScheme.primary : null),
+      title: Text(title),
+      subtitle: sub == null ? null : Text(sub, style: const TextStyle(fontSize: 12)),
+      onTap: onTap,
+    );
+  }
+
+  Widget _check(bool value, String title, String sub, ValueChanged<bool> on) {
+    return CheckboxListTile(
+      dense: true,
+      contentPadding: const EdgeInsets.only(left: 24),
+      controlAffinity: ListTileControlAffinity.leading,
+      value: value,
+      onChanged: (v) => on(v ?? false),
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: Text(sub, style: const TextStyle(fontSize: 12)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final w = widget;
+    final hasChoice = w.rows.isNotEmpty || w.looseSongs > 0;
+    return AlertDialog(
+      title: const Text('Back up'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _option(
+                  !_audio,
+                  'Song list only',
+                  'Small file. Songs can be downloaded again after a restore.',
+                  () => setState(() => _audio = false)),
+              _option(
+                  _audio,
+                  'Song list + audio files',
+                  'The music files (mp3 / m4a) in one .zip. This can be big and needs the same amount of free space for a moment.',
+                  () => setState(() => _audio = true)),
+              if (_audio) ...[
+                const Divider(),
+                _option(
+                    _all,
+                    'All songs',
+                    '${_songsText(w.totalSongs)} · ${_fmtBytes(w.totalBytes)}',
+                    () => setState(() => _all = true),
+                    indent: 12),
+                if (hasChoice)
+                  _option(
+                      !_all,
+                      'Only some playlists',
+                      'Tick the playlists to include',
+                      () => setState(() => _all = false),
+                      indent: 12),
+                if (!_all) ...[
+                  for (final r in w.rows)
+                    _check(
+                        _ids.contains(r.id),
+                        r.name,
+                        '${_songsText(r.songs)} · ${_fmtBytes(r.bytes)}',
+                        (v) => setState(() {
+                              if (v) {
+                                _ids.add(r.id);
+                              } else {
+                                _ids.remove(r.id);
+                              }
+                            })),
+                  if (w.looseSongs > 0)
+                    _check(
+                        _loose,
+                        'Songs not in a playlist',
+                        '${_songsText(w.looseSongs)} · ${_fmtBytes(w.looseBytes)}',
+                        (v) => setState(() => _loose = v)),
+                ],
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(
+          onPressed: _valid
+              ? () => Navigator.pop(
+                  context,
+                  _BackupChoice(
+                      audio: _audio,
+                      all: _all,
+                      folderIds: Set.of(_ids),
+                      loose: _loose))
+              : null,
+          child: const Text('Back up'),
+        ),
+      ],
+    );
+  }
+}
+
+/// A playlist song whose download failed, and why (plain words).
+class _FailedSong {
+  final PendingSong song;
+  final String reason;
+  const _FailedSong(this.song, this.reason);
 }

@@ -8,6 +8,8 @@ import UIKit
   private var fxPlayer: FxPlayer?
   /// Tells the app if the phone is on Wi-Fi or mobile data (Download over Wi-Fi only).
   private var networkBridge: NetworkBridge?
+  /// Hands a finished backup .zip to the Files "Save to..." screen.
+  private var backupExport: BackupExport?
 
   override func application(
     _ application: UIApplication,
@@ -23,6 +25,9 @@ import UIKit
     }
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "NetworkBridge") {
       networkBridge = NetworkBridge(messenger: registrar.messenger())
+    }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "BackupExport") {
+      backupExport = BackupExport(messenger: registrar.messenger())
     }
   }
 }
@@ -57,5 +62,83 @@ final class NetworkBridge {
     if p.usesInterfaceType(.wifi) || p.usesInterfaceType(.wiredEthernet) { return "wifi" }
     if p.usesInterfaceType(.cellular) { return "mobile" }
     return "other"
+  }
+}
+
+/// Answers "exportFile" on the channel "ytmusicweb/backup": shows the system
+/// "Save to Files" screen for a finished backup file and replies true (saved)
+/// or false (cancelled). The file is copied, so the app can delete its own copy.
+final class BackupExport: NSObject, UIDocumentPickerDelegate {
+  private let channel: FlutterMethodChannel
+  private var pending: FlutterResult?
+
+  init(messenger: FlutterBinaryMessenger) {
+    channel = FlutterMethodChannel(name: "ytmusicweb/backup", binaryMessenger: messenger)
+    super.init()
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "exportFile" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      guard let args = call.arguments as? [String: Any], let path = args["path"] as? String else {
+        result(FlutterError(code: "args", message: "No file given", details: nil))
+        return
+      }
+      self?.export(path: path, result: result)
+    }
+  }
+
+  private func topController() -> UIViewController? {
+    let scene = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .first { $0.activationState == .foregroundActive }
+      ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+    var top = scene?.windows.first(where: { $0.isKeyWindow })?.rootViewController
+      ?? scene?.windows.first?.rootViewController
+    while let next = top?.presentedViewController { top = next }
+    return top
+  }
+
+  private func export(path: String, result: @escaping FlutterResult) {
+    if pending != nil {
+      result(FlutterError(code: "busy", message: "Another save is already open", details: nil))
+      return
+    }
+    guard FileManager.default.fileExists(atPath: path) else {
+      result(FlutterError(code: "missing", message: "The backup file is missing", details: nil))
+      return
+    }
+    guard let top = topController() else {
+      result(FlutterError(code: "save", message: "Could not open the save screen", details: nil))
+      return
+    }
+    let url = URL(fileURLWithPath: path)
+    let picker: UIDocumentPickerViewController
+    if #available(iOS 14.0, *) {
+      picker = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+    } else {
+      picker = UIDocumentPickerViewController(url: url, in: .exportToService)
+    }
+    picker.delegate = self
+    pending = result
+    top.present(picker, animated: true)
+  }
+
+  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    let r = pending
+    pending = nil
+    r?(true)
+  }
+
+  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentAt url: URL) {
+    let r = pending
+    pending = nil
+    r?(true)
+  }
+
+  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+    let r = pending
+    pending = nil
+    r?(false)
   }
 }
