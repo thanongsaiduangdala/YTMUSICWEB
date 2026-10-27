@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:audio_metadata_reader/audio_metadata_reader.dart';
 import 'package:audio_service/audio_service.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -34,20 +35,16 @@ Future<void> main() async {
   runApp(const YtMusicApp());
 }
 
-/// Shuffle and repeat for songs played from the phone, plus the sleep timer.
-/// One shared object, so the full-screen player and the audio handler both
-/// see the same state.
 class PlayerOptions extends ChangeNotifier {
   bool shuffle = false;
-  int repeat = 1; // 0 = off, 1 = repeat all (the queue loops), 2 = repeat one
+  int repeat = 1;
 
-  /// Set by the page: re-orders the queue when shuffle is switched.
   VoidCallback? onShuffleChanged;
 
   Timer? _sleepTimer;
-  DateTime? sleepAt; // when the timer pauses the music
-  bool sleepAtSongEnd = false; // pause when the current song ends
-  String? armedSong; // website song that was playing when that was set
+  DateTime? sleepAt;
+  bool sleepAtSongEnd = false;
+  String? armedSong;
 
   bool get sleepActive => sleepAt != null || sleepAtSongEnd;
 
@@ -109,8 +106,6 @@ class PlayerOptions extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// True (and the timer is cleared) if the music should stop at the end of
-  /// this song.
   bool consumeSleepAtEnd() {
     if (!sleepAtSongEnd) return false;
     cancelSleep();
@@ -120,15 +115,12 @@ class PlayerOptions extends ChangeNotifier {
 
 final PlayerOptions playerOpts = PlayerOptions();
 
-/// The most the volume booster can add, in dB.
 const double kMaxBoostDb = 12;
 
-/// Centre frequencies (Hz) of the 10 sliders on the Personalize sound page.
 const List<double> kEqFreqs = [
   32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000
 ];
 
-/// One equaliser setting: a gain in dB for each of the 10 frequencies.
 class EqProfile {
   final String id, name, desc;
   final List<double> gains;
@@ -150,25 +142,20 @@ class EqProfile {
   }
 }
 
-/// A ready-made mix of the four sound-effect sliders.
 class FxPreset {
   final String id, name;
   final double wide, bass, clarity, room;
   const FxPreset(this.id, this.name, this.wide, this.bass, this.clarity, this.room);
 }
 
-/// The equaliser on / off, the sliders, the chosen profile and the profiles
-/// the person made. One shared object: the page edits it, the audio handler
-/// applies it to the player.
 class EqSettings extends ChangeNotifier {
   bool enabled = false;
   String selectedId = 'flat';
   List<double> gains = List<double>.filled(kEqFreqs.length, 0);
   List<EqProfile> custom = [];
-  // Volume booster in dB (0 = off), separate from the equaliser switch.
+
   double boostDb = 0;
-  // Sound effects (0..1 each): stereo width / virtual surround, bass
-  // enhancer, clarity (treble + presence), room (reverb).
+
   double fxWide = 0, fxBass = 0, fxClarity = 0, fxRoom = 0;
   String fxId = 'off';
   Timer? _applyTimer;
@@ -184,7 +171,6 @@ class EqSettings extends ChangeNotifier {
     FxPreset('vocalfx', 'Vocal presence', 0.2, 0, 0.7, 0.15),
   ];
 
-  // Gains at: 32  64  125  250  500  1k  2k  4k  8k  16k
   static const List<EqProfile> builtIns = [
     EqProfile('flat', 'Flat / Reference',
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -263,7 +249,6 @@ class EqSettings extends ChangeNotifier {
     return null;
   }
 
-  // The sliders no longer match the chosen profile.
   bool get modified {
     final p = selected;
     if (p == null) return true;
@@ -273,9 +258,6 @@ class EqSettings extends ChangeNotifier {
     return false;
   }
 
-  /// Gain for any frequency: straight lines between the sliders on a
-  /// logarithmic frequency scale. Used to fit the 10 sliders onto however many
-  /// bands the phone's own equaliser has.
   double gainAtHz(double hz) {
     final f = kEqFreqs;
     if (hz <= f.first) return gains.first;
@@ -345,13 +327,12 @@ class EqSettings extends ChangeNotifier {
   void _changed() {
     notifyListeners();
     _save();
-    // Sliders move often: send to the player a moment after the last change.
+
     _applyTimer?.cancel();
     _applyTimer =
         Timer(const Duration(milliseconds: 80), () => audioHandler.applyEq());
   }
 
-  /// Redraws the page (e.g. after the player accepted or refused the settings).
   void refresh() => notifyListeners();
 
   void setEnabled(bool on) {
@@ -370,7 +351,6 @@ class EqSettings extends ChangeNotifier {
     _changed();
   }
 
-  /// One of the four effect sliders moved: the preset becomes "custom".
   void setFx({double? wide, double? bass, double? clarity, double? room}) {
     if (wide != null) fxWide = wide;
     if (bass != null) fxBass = bass;
@@ -380,8 +360,6 @@ class EqSettings extends ChangeNotifier {
     _changed();
   }
 
-  /// Extra dB the clarity slider adds at a frequency (for downloaded songs,
-  /// where it is done with the phone's own equaliser).
   double clarityDbAt(double hz) {
     if (fxClarity <= 0) return 0;
     if (hz < 1500) return 0;
@@ -416,7 +394,6 @@ class EqSettings extends ChangeNotifier {
     _changed();
   }
 
-  // Saves the sliders into the chosen profile (only your own profiles).
   void updateSelected() {
     final p = selected;
     if (p == null || p.builtIn) return;
@@ -439,10 +416,6 @@ class EqSettings extends ChangeNotifier {
 
 final EqSettings eqState = EqSettings();
 
-/// Shows what the web page is playing in the Android notification / lock screen,
-/// and forwards the notification buttons back to the page.
-/// iPhone: talks to FxPlayer.swift (AVAudioEngine). Mirrors the small part of
-/// just_audio's AudioPlayer that WebAudioHandler needs.
 class IosFxEngine {
   static const MethodChannel _ch = MethodChannel('ytmusicweb/fxplayer');
   final _changes = StreamController<void>.broadcast();
@@ -525,7 +498,7 @@ class IosFxEngine {
   }
 
   Future<void> pause() async {
-    playing = false; // first, so the position stops growing at once
+    playing = false;
     _take(await _ch.invokeMapMethod<String, dynamic>('pause'));
     _changes.add(null);
   }
@@ -550,52 +523,41 @@ class IosFxEngine {
 }
 
 class WebAudioHandler extends BaseAudioHandler {
-  /// Set by the page: runs JavaScript inside the webview.
-  /// Set by the page: forgets the website's cookies / storage and reloads it.
+
   Future<void> Function()? resetPageSession;
 
   Future<void> Function(String js)? runJs;
-  /// Runs JavaScript in the website and returns what it answers.
+
   Future<Object> Function(String js)? runJsResult;
   String _lastKey = '';
 
   Future<void> _js(String code) async => runJs?.call(code);
 
-  // ---- Local (on-device) playback ------------------------------------------
-  // The phone's own equaliser (Android) sits in the player's audio chain.
   final AndroidEqualizer equalizer = AndroidEqualizer();
-  // The volume booster: makes the whole song louder than the volume buttons.
+
   final AndroidLoudnessEnhancer loudness = AndroidLoudnessEnhancer();
   late final AudioPlayer _player = AudioPlayer(
       audioPipeline:
           AudioPipeline(androidAudioEffects: [equalizer, loudness]));
-  bool eqReady = false; // a file was loaded, so the effects exist
-  bool? eqWorks; // null = not tried, false = this phone refused it
+  bool eqReady = false;
+  bool? eqWorks;
   bool? boostWorks;
   static const MethodChannel _fx = MethodChannel('ytmusicweb/fx');
   Map<String, dynamic> fxNative = {};
-  /// What the effects script inside the website says about itself.
+
   String webEqStatus = '';
   bool _local = false;
 
-  /// Set by the page: next / previous song in the on-device list.
   Future<void> Function()? localNext, localPrev;
 
-  /// Set by the page: an on-device song ended by itself (shuffle / repeat
-  /// decide what comes next). Falls back to localNext.
   Future<void> Function()? localEnded;
 
   bool get isLocal => _local;
 
-  /// "title|artist" of the website song that was reported last.
   String webSongKey = '';
 
-  /// Set by the page: called when on-device playback stops.
   VoidCallback? localStopped;
 
-  // iPhone: on-device songs play through our own AVAudioEngine player
-  // (ios/Runner/FxPlayer.swift) because just_audio has no equaliser on iOS.
-  // On Android this object is never created and nothing changes.
   late final IosFxEngine _ios = IosFxEngine();
 
   bool get _lPlaying => Platform.isIOS ? _ios.playing : _player.playing;
@@ -615,7 +577,7 @@ class WebAudioHandler extends BaseAudioHandler {
   void _onLocalCompleted() {
     if (!_local) return;
     if (playerOpts.consumeSleepAtEnd()) {
-      // Sleep timer: stop after this song.
+
       _lPause();
       return;
     }
@@ -640,8 +602,6 @@ class WebAudioHandler extends BaseAudioHandler {
     }
   }
 
-  // Download helper: notes the audio links the YouTube Music page itself uses
-  // for the song that is playing (the page already has YouTube's tokens).
   static const gvHookJs = r'''
 (function () {
   if (window.__gv) return;
@@ -739,11 +699,6 @@ class WebAudioHandler extends BaseAudioHandler {
 })();
 ''';
 
-
-  // Personalize sound for songs streaming from the website: the site's own
-  // <video> is routed through a Web Audio chain (10 filters + booster + a
-  // limiter). It is only built the first time the equaliser or the booster is
-  // switched on, so people who never use it keep the site's untouched audio.
   static const webEqJs = r'''
 (function () {
   if (window.__webEq) return;
@@ -933,8 +888,6 @@ class WebAudioHandler extends BaseAudioHandler {
 })();
 ''';
 
-
-  /// Sends the current Personalize sound settings to the website's player.
   void pushWebEq() {
     final code = 'window.__webEqCfg=${jsonEncode({
           'on': eqState.enabled,
@@ -953,15 +906,14 @@ class WebAudioHandler extends BaseAudioHandler {
   static const _pauseWebJs =
       "var v=document.querySelector('video');if(v){v.pause();}";
 
-  /// Plays a file from the phone and shows it in the notification / lock screen.
   Future<void> playLocal({
     required String path,
     required String title,
     String? artist,
     String? artPath,
-    Duration? startAt, // begin here instead of at 0:00
+    Duration? startAt,
   }) async {
-    await _js(_pauseWebJs); // stop the website's player first
+    await _js(_pauseWebJs);
     _local = true;
     _lastKey = '';
     final item = MediaItem(
@@ -974,7 +926,7 @@ class WebAudioHandler extends BaseAudioHandler {
     final Duration? d =
         Platform.isIOS ? await _ios.load(path) : await _player.setFilePath(path);
     eqReady = true;
-    // Before the song starts, so it never plays flat for a moment first.
+
     await applyEq().timeout(const Duration(seconds: 2), onTimeout: () {});
     mediaItem.add(item.copyWith(duration: d));
     if (startAt != null &&
@@ -982,16 +934,14 @@ class WebAudioHandler extends BaseAudioHandler {
         (d == null || startAt < d)) {
       await _lSeek(startAt);
     }
-    _lPlay(); // not awaited: on Android it only finishes when the song ends
+    _lPlay();
   }
 
-  /// Sends the Personalize sound settings to the player's equaliser. The
-  /// sliders (10 points) are fitted onto the phone's own bands.
   Future<void> applyEq() async {
-    pushWebEq(); // songs streaming from the website
+    pushWebEq();
     if (!eqReady) return;
     if (Platform.isIOS) {
-      // Songs on the phone: the native player has the whole chain.
+
       try {
         await _ios.applyFx({
           'on': eqState.enabled,
@@ -1027,7 +977,7 @@ class WebAudioHandler extends BaseAudioHandler {
     } catch (_) {
       eqWorks = false;
     }
-    // Its own try: a phone without an equaliser may still have the booster.
+
     try {
       await loudness.setEnabled(eqState.boostDb > 0);
       if (eqState.boostDb > 0) await loudness.setTargetGain(eqState.boostDb);
@@ -1035,7 +985,7 @@ class WebAudioHandler extends BaseAudioHandler {
     } catch (_) {
       boostWorks = false;
     }
-    // Width, bass enhancer and room use the phone's own audio effects.
+
     try {
       final id = _player.androidAudioSessionId;
       if (id != null) {
@@ -1056,7 +1006,7 @@ class WebAudioHandler extends BaseAudioHandler {
     _local = false;
     _lastKey = '';
     await _lStop();
-    // Nothing is playing any more: clear it so the mini player hides.
+
     mediaItem.add(null);
     playbackState.add(playbackState.value.copyWith(
       processingState: AudioProcessingState.idle,
@@ -1065,8 +1015,6 @@ class WebAudioHandler extends BaseAudioHandler {
     localStopped?.call();
   }
 
-  /// Stops the on-device player WITHOUT clearing the notification, because
-  /// the website is about to take over (e.g. to play the next online song).
   Future<void> releaseLocal() async {
     if (!_local) return;
     _local = false;
@@ -1099,7 +1047,6 @@ class WebAudioHandler extends BaseAudioHandler {
     ));
   }
 
-  // ---- Buttons (notification / lock screen) --------------------------------
   @override
   Future<void> play() => _local
       ? _lPlay()
@@ -1148,11 +1095,9 @@ class WebAudioHandler extends BaseAudioHandler {
     await super.stop();
   }
 
-  /// Called with what the page reports every second or so.
   void onWebState(Map<String, dynamic> d) {
     if (_local) {
-      // An on-device song is playing: ignore the website, unless the person
-      // started a song there, then hand playback back to the website.
+
       if (d['playing'] != true) return;
       _local = false;
       _lStop();
@@ -1166,7 +1111,7 @@ class WebAudioHandler extends BaseAudioHandler {
     if (playerOpts.sleepAtSongEnd &&
         playerOpts.armedSong != null &&
         songKey != playerOpts.armedSong) {
-      // Sleep timer "end of song": the website moved on to the next song.
+
       playerOpts.cancelSleep();
       _js(_pauseWebJs);
     }
@@ -1227,85 +1172,72 @@ class YtMusicPage extends StatefulWidget {
 class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   late final WebViewController _controller;
   bool _wasPlaying = false;
-  bool _playerOpen = false; // full-screen player page is showing
+  bool _playerOpen = false;
 
-  // What the page last reported as playing, and the saved list.
   Map<String, dynamic> _now = {};
   String _nowVid = '';
   List<SavedSong> _saved = [];
 
-  // Songs copied onto the phone (played with just_audio).
   List<LocalSong> _localSongs = [];
-  int _localIdx = -1; // which one is playing, -1 = none
-  List<LocalSong>? _queue; // the folder being played (Next / Previous follow it)
-  List<LocalSong>? _queueOrig; // the same folder in its own order (no shuffle)
+  int _localIdx = -1;
+  List<LocalSong>? _queue;
+  List<LocalSong>? _queueOrig;
 
-  // Playlist folders in the Download tab. Every song is also in "Download".
   List<PlaylistFolder> _playlists = [];
-  // Bumped whenever songs / folders / the playing song change, so an open
-  // folder page redraws.
+
   final ValueNotifier<int> _libTick = ValueNotifier<int>(0);
   void _touch() => _libTick.value++;
 
-  bool _downloading = false; // a song download is running
-  double? _dlProgress; // 0..1 while downloading, null = unknown
-  // Progress + log shown in Download tab -> Downloading.
+  bool _downloading = false;
+  double? _dlProgress;
+
   final DownloadManager _dl = DownloadManager();
 
-  // yt-dlp runs natively inside the app (see YtDlpBridge.kt).
   static const MethodChannel _ytdlp = MethodChannel('ytmusicweb/ytdlp');
   DownloadTask? _activeTask;
-  String? _playlistUrl; // set while a YouTube Music playlist page is open
-  String? _activeId; // yt-dlp process id of the running download
-  bool _batchCancel = false; // Stop pressed while the download list runs
-  // The download list: songs wait in _dl.pending (saved to the phone, so it
-  // carries on after the app is closed). One worker takes them one by one.
+  String? _playlistUrl;
+  String? _activeId;
+  bool _batchCancel = false;
+
   bool _queueRunning = false;
-  bool _readingPlaylist = false; // a playlist link is being read
-  PendingSong? _activeSong; // the song being downloaded right now
-  bool _skipCurrent = false; // cancel only the song that is downloading now
+  bool _readingPlaylist = false;
+  PendingSong? _activeSong;
+  bool _skipCurrent = false;
   DateTime _lastNative = DateTime.now();
   int _lastLogStep = -1;
-  bool _ytdlpChecked = false; // yt-dlp update check done this session
+  bool _ytdlpChecked = false;
 
-  // ---- Play the downloaded copy instead of streaming a song ----------------
-  String? _shadowVid; // online song whose downloaded copy is playing instead
-  // The website song that was paused for a downloaded copy. While this is
-  // set, the website's queue is waiting and carries on after the file(s).
+  String? _shadowVid;
+
   String? _resumeVid;
-  bool _wantWebPlay = false; // we pressed Next on the site and wait for it
+  bool _wantWebPlay = false;
   bool _offlineBusy = false;
-  // Setting: when a song that is also downloaded starts streaming, play the
-  // downloaded copy instead. On by default.
+
   bool _preferOffline = true;
-  // How songs are ordered in the Download folder and playlist folders:
-  // 0 newest first (default), 1 oldest first, 2 title A-Z, 3 artist A-Z.
+
   int _sortMode = 0;
   final Map<String, int> _addedCache = {};
-  // When each downloaded song (by file path) was last played, in ms. Used by
-  // the Storage page to find songs nobody listens to any more.
+
   Map<String, int> _lastPlayed = {};
-  // Setting: only download on Wi-Fi (downloads wait on mobile data).
+
   bool _wifiOnly = false;
-  // Failed downloads of a playlist: say which ones failed and offer to retry.
-  bool _retryAsk = true; // setting: ask when the list has finished
-  bool _retryAuto = false; // setting: retry by itself, no question
+
+  bool _retryAsk = true;
+  bool _retryAuto = false;
   final List<_FailedSong> _failedRound = [];
   bool _retryPromptOpen = false;
   int _autoRound = 0;
   static const int _autoRoundsMax = 5;
-  // Setting: Reset page session also starts the 15-second download warm-up
-  // again (like a fresh install). On by default.
+
   bool _resetWarmOnSession = true;
-  // Setting: MP3 quality of new downloads: 'high' (best), 'medium', 'small'.
+
   String _quality = 'high';
-  // Auto-retry: tries used per song (video id), and the file name to reuse so
-  // yt-dlp carries on from the half-downloaded file instead of starting over.
+
   final Map<String, int> _retries = {};
   final Map<String, String> _resumeIds = {};
   String? _lastAttemptId;
   DateTime _shadowStarted = DateTime.fromMillisecondsSinceEpoch(0);
-  // Downloaded files are named "<time>_<videoId>.mp3".
+
   static final _vidRe = RegExp(r'^\d+_([A-Za-z0-9_-]{11})\.[A-Za-z0-9]+$');
 
   bool _smartOn = false;
@@ -1372,7 +1304,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         ..clear()
         ..addAll(prefs.getStringList('smart_seen') ?? <String>[]);
     });
-    _syncLocalVids(); // the setting may be off: stop swapping to files
+    _syncLocalVids();
     _smartKick();
   }
 
@@ -1429,8 +1361,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     setState(() => _preferOffline = on);
     SharedPreferences.getInstance()
         .then((p) => p.setBool('prefer_offline', on));
-    _syncLocalVids(); // tells the website which songs it may swap
-    _touch(); // redraws the open Settings page
+    _syncLocalVids();
+    _touch();
   }
 
   void _setResetWarm(bool on) {
@@ -1464,12 +1396,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _touch();
   }
 
-  // yt-dlp --audio-quality value: 0 = best (variable, ~245 kbps).
   String get _qualityArg =>
       _quality == 'small' ? '128K' : (_quality == 'medium' ? '192K' : '0');
 
-  // True when the phone is on Wi-Fi (or ethernet). If the check itself does
-  // not work, answer yes so downloads are never blocked by mistake.
   Future<bool> _onWifi() async {
     try {
       final t = await _ytdlp.invokeMethod<String>('network');
@@ -1571,7 +1500,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _smartSeen.add(vid);
         _persistSmart();
         if (mounted) setState(() {});
-        // It waits in the download list like every other song.
+
         _enqueue([
           PendingSong(vid, title, artist, null,
               art: q['art'] ?? '', smart: true)
@@ -1604,9 +1533,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList('local_songs') ?? [];
     final list = <LocalSong>[];
-    // iPhone: the app's folder can get a new address after an update or a
-    // re-install from Xcode, so a saved full path stops working. If the file
-    // is gone from the saved place but is in today's music folder, use that.
+
     String? musicDir;
     try {
       musicDir = '${(await getApplicationDocumentsDirectory()).path}/music';
@@ -1665,10 +1592,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     await _rescanMusic();
   }
 
-  // Finds downloaded MP3s in the music folder that the song list does not know
-  // (app data cleared, list damaged) and adds them back. The title / artist /
-  // cover come from the tags inside the file; older files without tags fall
-  // back to the saved-links list, then to the video id.
   Future<void> _rescanMusic() async {
     try {
       if (_downloading) return;
@@ -1740,14 +1663,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         'local_songs', _localSongs.map((s) => jsonEncode(s.toJson())).toList());
   }
 
-  // Audio the phone can play. (iPhone cannot play .ogg / .opus / .wma.)
   static const List<String> _audioExts = [
     'mp3', 'm4a', 'aac', 'wav', 'aif', 'aiff', 'caf', 'flac',
   ];
 
-  // iPhone: FileType.audio opens the Apple Music library (not the Files app)
-  // and returns converted copies, so MP3s kept in Files cannot be chosen and
-  // the copies may have no usable name. The Files picker is used instead.
   Future<List<PlatformFile>> _pickAudio() {
     if (Platform.isIOS) {
       return FilePicker.pickFiles(
@@ -1756,9 +1675,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return FilePicker.pickFiles(type: FileType.audio);
   }
 
-  // What the file really is, from its first bytes (null = not recognised).
-  // iPhone's player decides by the file name's ending, so a file with a wrong
-  // or missing ending fails with "could not play".
   Future<String?> _sniffAudioExt(File f) async {
     try {
       final raf = await f.open();
@@ -1769,7 +1685,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           String.fromCharCodes(b.skip(i).take(n).toList());
       if (at(0, 3) == 'ID3') return 'mp3';
       if (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0) {
-        // MPEG audio frame: layer bits 00 are invalid; ADTS AAC has them as 00
+
         return ((b[1] >> 1) & 0x03) == 0 ? 'aac' : 'mp3';
       }
       if (b.length >= 8 && at(4, 4) == 'ftyp') return 'm4a';
@@ -1782,9 +1698,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return null;
   }
 
-  // Copies a picked file into [destBase].<ext> (the right ending is chosen by
-  // looking inside the file). Returns the new path, or null if the file is
-  // empty or a kind this phone cannot play.
   Future<String?> _savePickedAudio(PlatformFile f, String destBase) async {
     final tmp = File('$destBase.part');
     try {
@@ -1823,10 +1736,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Lets the person pick audio files, copies them into the app's own storage,
-  // and reads the title / artist / cover art from the file's tags.
   Future<void> _addMusic() async {
-    // file_picker 13: pickFiles() returns a plain list (empty if cancelled).
+
     final files = await _pickAudio();
     if (files.isEmpty) return;
     final docs = await getApplicationDocumentsDirectory();
@@ -1880,8 +1791,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         .then((p) => p.setString('last_played', jsonEncode(_lastPlayed)));
   }
 
-  // Deletes many songs at once (Storage page). Same clean-up as _removeLocal,
-  // but the list is saved only once at the end.
   Future<void> _removeLocalMany(List<LocalSong> list) async {
     if (list.isEmpty) return;
     final paths = list.map((s) => s.path).toSet();
@@ -1924,7 +1833,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     await prefs.setString('last_played', jsonEncode(_lastPlayed));
   }
 
-  // ---- yt-dlp update (Settings) ------------------------------------------------
   Future<String> _checkYtDlp() async {
     if (_queueRunning || _downloading) {
       return 'Downloads are running. Try again when they have finished.';
@@ -1952,9 +1860,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // ---- Backup and restore --------------------------------------------------------
   static const String _backupApp = 'ytmusicweb-backup';
-  // Android / iPhone "save as" screen for the finished .zip (native side).
+
   static const MethodChannel _backupCh = MethodChannel('ytmusicweb/backup');
 
   Map<String, dynamic> _songRef(LocalSong s) =>
@@ -1965,8 +1872,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       .map((m) => Map<String, dynamic>.from(m))
       .toList();
 
-  // The list part of a backup. With [names] (song file -> its name inside the
-  // .zip) every song that has its audio in the backup points to it.
   Map<String, dynamic> _backupData([Map<String, _ZipNames>? names]) {
     Map<String, dynamic> ref(LocalSong s) {
       final m = _songRef(s);
@@ -2007,8 +1912,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // "What do you want to back up?" (list only / audio of everything / audio of
-  // some playlists).
   Future<_BackupChoice?> _askBackupOptions() async {
     final sizes = <String, int>{};
     for (final s in _localSongs) {
@@ -2041,7 +1944,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     );
   }
 
-  // The songs whose audio goes into the backup.
   List<LocalSong> _backupSongs(_BackupChoice c) {
     if (c.all) return List.of(_localSongs);
     final out = <LocalSong>[];
@@ -2064,7 +1966,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         fileName: 'ytmusic-backup-$day.json',
         bytes: bytes,
       );
-      if (where == null) return; // cancelled
+      if (where == null) return;
       _toast(
           'Backup saved: ${_songsText(_localSongs.length)}, ${_playlists.length} folder(s), ${_saved.length} saved link(s)');
     } catch (e) {
@@ -2072,8 +1974,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Shows a progress box that cannot be swiped away. Returns the function that
-  // closes it again (safe to call more than once).
   VoidCallback _openProgress(
       String title, ValueNotifier<_Prog> prog, VoidCallback onCancel) {
     var open = true;
@@ -2091,9 +1991,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     };
   }
 
-  // One .zip: backup.json (the list) + music/<audio files>. Built in the app's
-  // temporary folder piece by piece (big libraries do not need the memory),
-  // then handed to the system "save" screen.
   Future<void> _backupWithAudio(_BackupChoice c) async {
     final jobs = <_AudioJob>[];
     final used = <String>{};
@@ -2202,8 +2099,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             })) ??
             false;
       } on MissingPluginException {
-        // No "save as" screen on this platform: keep the file in the app's
-        // folder instead.
+
         final docs = await getApplicationDocumentsDirectory();
         final dir = Directory('${docs.path}/Backups');
         await dir.create(recursive: true);
@@ -2265,7 +2161,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       await _restoreData(data, zip);
     } finally {
       await zip?.close();
-      // The file picker keeps its own copy of a big file in the cache.
+
       try {
         final tmp = await getTemporaryDirectory();
         if (pickedPath != null && pickedPath.startsWith(tmp.path)) {
@@ -2275,8 +2171,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Takes the audio of a backup .zip out into the music folder and adds the
-  // songs to the library. Returns [restored, failed].
   Future<List<int>> _extractZipSongs(
       ZipReader zip, List<_ZipSong> items) async {
     var cancelled = false;
@@ -2310,15 +2204,14 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         final label =
             '$i of ${items.length}\n${z.title.isEmpty ? z.file : z.title}';
         prog.value = _Prog(label, total == 0 ? null : math.min(1.0, done / total));
-        // Only the file's own name is used (never a path from the zip), and
-        // only safe characters.
+
         final base = z.file
             .split('/')
             .last
             .replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
         var dest = '${dir.path}/$base';
         if (File(dest).existsSync()) {
-          // A different file already has this name: new time stamp, same id.
+
           final m = RegExp(r'^\d+_(.+)$').firstMatch(base);
           final stamp = DateTime.now().millisecondsSinceEpoch + i;
           dest = '${dir.path}/${stamp}_${m != null ? m.group(1) : base}';
@@ -2365,7 +2258,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         ok++;
       }
     } catch (_) {
-      // what was copied so far is kept
+
     } finally {
       closeProgress();
     }
@@ -2383,10 +2276,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     final libraryIn = _maps(data['library']);
     final foldersIn = _maps(data['folders']);
 
-    // Songs of the backup that are not on this phone: the ones whose audio is
-    // inside the .zip, and the ones that can be downloaded again (they need a
-    // video id). Folder songs first, so they keep their folder when the list
-    // skips duplicates.
     final missing = <PendingSong>[];
     final zipSongs = <_ZipSong>[];
     final seen = <String>{};
@@ -2465,7 +2354,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     );
     if (ask == null || ask == 0 || !mounted) return;
 
-    // Audio files from the .zip go in first, so the folders below find them.
     var audioDone = 0, audioFailed = 0;
     if ((ask == 3 || ask == 4) && zip != null) {
       final r = await _extractZipSongs(zip, zipSongs);
@@ -2474,15 +2362,13 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       if (!mounted) return;
     }
 
-    // Saved links
     final newSaved = savedIn.where((s) => !_saved.any((x) => s.vid.isNotEmpty
         ? x.vid == s.vid
         : (x.title == s.title && x.artist == s.artist))).toList();
     _saved = [..._saved, ...newSaved];
 
-    // Folders: merged into an existing one (same id or link) or created.
     var created = 0;
-    final idMap = <String, String>{}; // id in the backup -> id of the folder here
+    final idMap = <String, String>{};
     for (final fj in foldersIn) {
       final backupId = (fj['id'] as String?) ?? '';
       var id = backupId;
@@ -2511,8 +2397,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (i >= 0) f.paths.add(_localSongs[i].path);
       }
     }
-    // A queued song goes to the folder as it is named here (it may have been
-    // matched to an existing folder under a different id).
+
     final fixed = [
       for (final m in missing)
         PendingSong(m.vid, m.title, m.artist,
@@ -2569,8 +2454,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // The person picked a song in a folder: that folder becomes the play queue
-  // and the website's queue is dropped.
   Future<bool> _playQueue(List<LocalSong> queue, int pos) {
     if (pos < 0 || pos >= queue.length) return Future.value(false);
     _shadowVid = null;
@@ -2581,7 +2464,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return _playLocal(_localSongs.indexOf(first));
   }
 
-  // The folder's Shuffle button: switch shuffle on and start with a random song.
   Future<bool> _shuffleQueue(List<LocalSong> list) {
     if (list.isEmpty) return Future.value(false);
     playerOpts.setShuffle(true, apply: false);
@@ -2589,13 +2471,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return _playQueue(list, list.indexOf(pick));
   }
 
-  // `first` stays on top, everything else is mixed.
   List<LocalSong> _shuffledFirst(List<LocalSong> q, LocalSong? first) {
     final rest = q.where((x) => !identical(x, first)).toList()..shuffle();
     return [if (first != null && q.contains(first)) first, ...rest];
   }
 
-  // Shuffle switched on / off while a folder is playing.
   void _applyShuffle() {
     final q = _queue;
     if (q == null || q.isEmpty) return;
@@ -2611,8 +2491,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // An on-device song ended by itself. Repeat one plays it again; repeat off
-  // stops after the last song; otherwise the next song (the list loops).
   void _onLocalEnded() {
     if (_localSongs.isEmpty) return;
     if (playerOpts.repeat == 2 && _localIdx >= 0) {
@@ -2633,7 +2511,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _stepLocal(1);
   }
 
-  // Next / previous song inside the folder being played (or all songs).
   void _stepLocal(int delta) {
     if (_localSongs.isEmpty) return;
     final q = (_queue != null && _queue!.isNotEmpty) ? _queue! : _localSongs;
@@ -2676,7 +2553,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   int _localIndexByVid(String vid) =>
       vid.isEmpty ? -1 : _localSongs.indexWhere((s) => _vidOf(s) == vid);
 
-  // By video id first, then by title + artist (songs added by hand).
   int _findLocal(String vid, String title, String artist) {
     final i = _localIndexByVid(vid);
     if (i >= 0) return i;
@@ -2685,15 +2561,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         .indexWhere((s) => s.title == title && s.artist == artist);
   }
 
-  // Tells the website which songs are on the phone, so it can stop streaming
-  // them the moment they start (see _shadowJs).
   void _syncLocalVids() {
-    // Empty list = the website never swaps a streamed song for its file.
+
     final vids = _preferOffline
         ? _localSongs.map(_vidOf).where((v) => v.isNotEmpty).toList()
         : <String>[];
-    // Title + artist of every song that has both: lets the website also swap
-    // a different upload of the same song (audio / video / re-upload).
+
     final keys = _preferOffline
         ? _localSongs
             .where((s) => s.title.trim().isNotEmpty && s.artist.trim().isNotEmpty)
@@ -2721,7 +2594,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Plays the downloaded copy while the website's copy stays paused.
   Future<void> _startShadow(int i, String vid,
       {Duration? start}) async {
     _shadowVid = vid;
@@ -2730,7 +2602,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _shadowStarted = DateTime.now();
     final ok = await _playLocal(i, start: start);
     if (!ok && _shadowVid == vid) {
-      // The file would not play: let the website play this song after all.
+
       _shadowVid = null;
       _resumeVid = null;
       if (mounted) setState(() {});
@@ -2741,19 +2613,17 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // The website just started a song that is downloaded (message from _shadowJs).
   void _onShadowPlay(String message) {
     var vid = '', lt = '', la = '';
     try {
       final m = jsonDecode(message) as Map;
       vid = (m['vid'] as String?) ?? '';
-      lt = (m['lt'] as String?) ?? ''; // set when matched by title + artist
+      lt = (m['lt'] as String?) ?? '';
       la = (m['la'] as String?) ?? '';
     } catch (_) {}
     if (vid.isEmpty) return;
     if (_shadowVid == vid) {
-      // The person pressed play on the website's own player while the
-      // downloaded copy is the one making the sound: use it as play / pause.
+
       if (DateTime.now().difference(_shadowStarted).inMilliseconds < 1500) {
         return;
       }
@@ -2771,7 +2641,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     if (i >= 0) {
       _startShadow(i, vid);
     } else if (lt.isNotEmpty) {
-      // The page already paused the song for a file we cannot find: let it play.
+
       _controller
           .runJavaScript('window.__allowWeb=${jsonEncode(vid)};'
               "var v=document.querySelector('video');if(v){v.play();}")
@@ -2779,22 +2649,19 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Looks at what the website reports. Returns false when the report should
-  // not reach the notification (a downloaded copy is standing in).
   bool _onWebReport(Map<String, dynamic> d) {
     final playing = d['playing'] == true;
     if (playing) _wantWebPlay = false;
     final vid = _reportVid(d);
 
     if (_shadowVid != null) {
-      if (vid == _shadowVid || !playing) return false; // site stays quiet
-      // The website is playing another song now: it takes over again.
+      if (vid == _shadowVid || !playing) return false;
+
       _shadowVid = null;
       _resumeVid = null;
       return true;
     }
 
-    // Phone went offline (or the song is stuck) while streaming: use the file.
     final offline = d['online'] == false || d['stalled'] == true;
     if (playing && offline) _maybeGoOffline(d, vid);
     return true;
@@ -2804,7 +2671,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     if (_offlineBusy) return;
     _offlineBusy = true;
     try {
-      // "offline" from the page is trusted; a stuck song gets a real check.
+
       if (d['online'] != false && await _online()) return;
       if (_shadowVid != null) return;
       final title = ((d['title'] as String?) ?? '').trim();
@@ -2820,14 +2687,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // A downloaded song ended (or Next / Previous was pressed) while the
-  // website's queue is waiting. With internet: go on with the website's queue.
-  // Without: play the next downloaded song and keep the queue waiting, so it
-  // carries on once the internet is back.
   Future<void> _webStep(bool next) async {
     final old = _resumeVid;
     if (!await _online()) {
-      _shadowVid = null; // _resumeVid stays: the website's queue still waits
+      _shadowVid = null;
       _stepLocal(next ? 1 : -1);
       return;
     }
@@ -2842,11 +2705,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     } else {
       await audioHandler.skipToPrevious();
     }
-    // The site sometimes stays paused after the click: start it.
+
     for (final ms in [800, 2000, 4000]) {
       await Future.delayed(Duration(milliseconds: ms));
       if (!_wantWebPlay || !mounted) return;
-      if (_reportVid(_now) == old) continue; // it did not move on
+      if (_reportVid(_now) == old) continue;
       _controller.runJavaScript(_resumeJs).catchError((_) {});
     }
     _wantWebPlay = false;
@@ -2855,13 +2718,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   Future<void> _shadowPrev() async {
     if (audioHandler.playbackState.value.position >
         const Duration(seconds: 3)) {
-      await audioHandler.seek(Duration.zero); // like other players: restart
+      await audioHandler.seek(Duration.zero);
     } else {
       await _webStep(false);
     }
   }
 
-  // Messages from the native side (YtDlpBridge.kt): progress and yt-dlp output.
   Future<dynamic> _onNative(MethodCall call) async {
     if (call.method != 'progress') return null;
     final t = _activeTask;
@@ -2883,7 +2745,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _dl.log('Downloading ${pct.round()}%');
       }
     }
-    // Progress lines repeat constantly ("[download]  12.3% of ..."), skip them.
+
     if (line.isNotEmpty && !line.contains('% of')) {
       if (line.contains('[ExtractAudio]') || line.contains('[ffmpeg]')) {
         t.status = DlStatus.saving;
@@ -2895,8 +2757,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return null;
   }
 
-  // The player-page download button: adds the song that is playing to the
-  // download list (it starts at once when nothing else is downloading).
   Future<void> _downloadCurrent() async {
     final title = ((_now['title'] as String?) ?? '').trim();
     final artist = ((_now['artist'] as String?) ?? '').trim();
@@ -2963,9 +2823,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _toast('Saved. Add its MP3 later from the Download tab.');
   }
 
-  // Downloaded files are named "<time>_<videoId>.mp3", so the id tells us.
-  // True when the song that is playing is already downloaded (the player
-  // page's download button then shows a "done" icon).
   bool get _nowDownloaded {
     final title = ((_now['title'] as String?) ?? '').trim();
     if (title.isEmpty) return false;
@@ -2973,7 +2830,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _nowVid, title, ((_now['artist'] as String?) ?? '').trim());
   }
 
-  // The song that is playing is being downloaded now / waits in the list.
   bool get _nowActive => _nowVid.isNotEmpty && _activeSong?.vid == _nowVid;
   bool get _nowWaiting =>
       _nowVid.isNotEmpty && _dl.pending.any((p) => p.vid == _nowVid);
@@ -2983,9 +2839,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           (vid.isNotEmpty && s.path.contains('_$vid.')) ||
           (s.title == title && s.artist == artist));
 
-  // Downloads ONE song with yt-dlp (inside the app) and adds it to
-  // "On this device". Used by the player button and by "Add playlist".
-  // The caller sets _downloading. Returns the task (status done or failed).
   Future<DownloadTask> _downloadVideo({
     required String vid,
     required String title,
@@ -3017,13 +2870,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           ? 'Starting yt-dlp...'
           : 'Starting yt-dlp (the first run unpacks it and checks for an update, this can take a minute)...');
 
-      // Says so in the log if yt-dlp has been quiet for a while.
       watchdog = Timer.periodic(const Duration(seconds: 10), (_) {
         final idle = DateTime.now().difference(_lastNative).inSeconds;
         if (idle >= 10) _dl.log('No output for ${idle}s, still working...');
       });
 
-      // iPhone cannot run yt-dlp, so the audio is fetched in Dart instead.
       outPath = Platform.isIOS
           ? await _downloadWithDart(vid, id, dir, task)
           : await _ytdlp.invokeMethod<String>('download', {
@@ -3047,7 +2898,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       task.pct = 100;
       _dl.log('MP3 ready (${(task.total / 1048576).toStringAsFixed(1)} MB)');
 
-      // keep the cover image for the lock screen / notification
       task.status = DlStatus.saving;
       _dl.changed();
       _dl.log('Saving cover art...');
@@ -3097,7 +2947,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return task;
   }
 
-  // Stops a running download (yt-dlp on Android, the Dart download on iPhone).
   final Map<String, VoidCallback> _dartCancels = {};
   void _cancelDownload(String id) {
     _dartCancels[id]?.call();
@@ -3106,9 +2955,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // The "who am I" string YouTube expects for a stream link. A link made for
-  // one YouTube app is refused (HTTP 403) when it is fetched with another
-  // app's identity, so it is read from the link's own "c=" part.
   static const String _uaIos =
       'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
   static const String _uaSafari =
@@ -3126,15 +2972,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return _uaSafari;
   }
 
-  // The audio link the YouTube Music page itself is using for the song that is
-  // playing right now (it already carries YouTube's tokens). Null if the page
-  // has not used a plain link for this song, or it is not an AAC / MP4 stream.
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?> _pageAudioLink(
       String vid,
       {bool quiet = false,
       Future<Object> Function(String js)? run}) async {
     try {
-      // By default the page the person is using; the download page passes its own.
+
       run ??= audioHandler.runJsResult;
       if (run == null) return null;
       var t = (await run('JSON.stringify(window.__gv && window.__gv.audio || null)')
@@ -3158,7 +3001,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       }
       final size = int.tryParse('${d['clen']}') ?? 0;
       if (size <= 0) return null;
-      // drop the page's own range / pacing parts; pieces add their own range
+
       final clean = '${d['url']}'.replaceAll(RegExp(r'[&?](range|rn|rbuf)=[^&]*'), '');
       final fixed = clean.contains('?') ? clean : clean.replaceFirst('&', '?');
       final post = '${d['method']}'.toUpperCase() == 'POST';
@@ -3180,14 +3023,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // ---- Warm-up: the page must look like a real listener --------------------
-  // On a fresh install YouTube may refuse downloads until the page has been used
-  // like a normal listener. So on iPhone the download list waits until the
-  // person either is signed in to YouTube Music, or has listened to 15 seconds
-  // of music in the page. After that it is remembered for good (saved on the
-  // phone), so it never waits again, also after the app is closed and opened.
   static const int _warmNeedSecs = 15;
-  bool _dlWarm = !Platform.isIOS; // iPhone: false until the warm-up is done
+  bool _dlWarm = !Platform.isIOS;
   int _warmSecs = 0;
   Timer? _warmTimer;
 
@@ -3195,7 +3032,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       "(function(){try{if(window.ytcfg&&ytcfg.get&&ytcfg.get('LOGGED_IN'))return true;}catch(e){}return /(^|; )(SAPISID|__Secure-3PAPISID)=/.test(document.cookie);})()";
 
   Future<void> _initWarmup() async {
-    if (!Platform.isIOS) return; // Android downloads with yt-dlp
+    if (!Platform.isIOS) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       if (prefs.getBool('dl_warm') == true) {
@@ -3227,9 +3064,8 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     });
   }
 
-  // Starts the warm-up from zero again (used by Reset page session).
   Future<void> _restartWarmup() async {
-    if (!Platform.isIOS) return; // Android downloads with yt-dlp
+    if (!Platform.isIOS) return;
     _warmTimer?.cancel();
     _warmTimer = null;
     _warmSecs = 0;
@@ -3257,16 +3093,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     if (mounted) setState(() {});
   }
 
-  // ---- The download page ------------------------------------------------------
-  // A second, hidden YouTube Music page used only to read a song's audio link.
-  // The page the person is using is never touched, so the song that is playing
-  // keeps playing while a playlist downloads.
   WebViewController? _dlWeb;
-  bool _dlWebOn = false; // the hidden page is in the widget tree
+  bool _dlWebOn = false;
   bool _dlSessionCopied = false;
 
-  // Creates (once) and shows the hidden page, and copies the login of the main
-  // page into it.
   Future<WebViewController> _ensureDownloadWeb() async {
     var c = _dlWeb;
     if (c == null) {
@@ -3297,8 +3127,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       }
       _dlSessionCopied = false;
     }
-    // WebKit freezes a web view that is not on screen. This one is put in the
-    // widget tree far outside the screen: not visible, but still "alive".
+
     if (!_dlWebOn && mounted) {
       setState(() => _dlWebOn = true);
       await Future<void>.delayed(const Duration(milliseconds: 300));
@@ -3307,14 +3136,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return c;
   }
 
-  // Copies the signed-in session of the main page to the download page.
-  // (On iPhone both pages already share WebKit's cookie store, which also holds
-  // the hidden "HttpOnly" cookies. The explicit copy below adds anything that
-  // is missing, plus the saved page data (localStorage).)
   Future<void> _copySessionToDownloadWeb(WebViewController dl) async {
     if (_dlSessionCopied) return;
     try {
-      // 1) read the main page's cookies + saved data
+
       Future<String> readMain(String js) async {
         final r = await _controller
             .runJavaScriptReturningResult(js)
@@ -3332,7 +3157,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       final cookieText = await readMain('document.cookie');
       final storage = await readMain(
           "(function(){var o={};try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);o[k]=localStorage.getItem(k);}}catch(e){}return JSON.stringify(o);})()");
-      // 2) open the YouTube Music page in the download page
+
       await dl.loadRequest(Uri.parse('https://music.youtube.com'));
       for (var i = 0; i < 40; i++) {
         await Future<void>.delayed(const Duration(milliseconds: 500));
@@ -3345,7 +3170,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             .replaceAll('"', '');
         if (st.startsWith('complete|music.youtube.com')) break;
       }
-      // 3) cookies the download page does not have yet
+
       final have = ((await dl.runJavaScriptReturningResult('document.cookie'))
               .toString()
               .replaceAll('"', ''))
@@ -3365,7 +3190,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             name: name, value: value, domain: '.youtube.com', path: '/'));
         added++;
       }
-      // 4) saved page data that is missing
+
       if (storage.length > 2) {
         await dl.runJavaScript(
             "(function(){try{var o=${jsonEncode(storage)};o=JSON.parse(o);for(var k in o){if(localStorage.getItem(k)===null)localStorage.setItem(k,o[k]);}}catch(e){}})()");
@@ -3380,7 +3205,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Frees the hidden page (called when the download list is finished).
   Future<void> _closeDownloadWeb() async {
     final c = _dlWeb;
     _dlWeb = null;
@@ -3391,11 +3215,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  // The song is not the one the page is playing: open it in the hidden download
-  // page, muted, just long enough for it to ask for the song's audio. The page
-  // the person is using (and the music that plays there) is never touched.
-  // Set when the page streams with YouTube's newer mode (requests with "sabr"),
-  // which has no plain audio link to take.
   bool _lastPageSabr = false;
 
   Future<({Uri url, int size, bool post, List<int> body, bool ump})?>
@@ -3419,8 +3238,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
 
     try {
-      // 1) let the page finish loading first (it may still be loading, or on a
-      //    slow VPN; opening a song now would cut it off)
+
       final ready = DateTime.now().add(const Duration(seconds: 30));
       var pageReady = false;
       while (DateTime.now().isBefore(ready)) {
@@ -3438,17 +3256,17 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       if (!pageReady) {
         _dl.log('The download page was not ready after 30 s (${await ask("document.readyState+'|'+location.href.slice(0,60)")})');
       }
-      // 2) open the song unless the page is already on it
+
       final cur = await ask(
           "(function(){try{var p=document.getElementById('movie_player');return p&&p.getVideoData?p.getVideoData().video_id:''}catch(e){return ''}})()");
       if (cur != vid) {
-        // forget the link of the previous song
+
         try {
           await web.runJavaScript('if(window.__gv){window.__gv.audio=null;}');
         } catch (_) {}
         await web.loadRequest(Uri.parse('https://music.youtube.com/watch?v=$vid'));
       }
-      // 3) wait for the page to ask for this song's audio
+
       var until = DateTime.now().add(const Duration(seconds: 45));
       var started = DateTime.now();
       var reloaded = false;
@@ -3461,7 +3279,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         } catch (_) {}
         final l = await _pageAudioLink(vid, quiet: true, run: run);
         if (l != null) return l;
-        // After ~10 s: is the page only using the newer streaming mode?
+
         if (DateTime.now().difference(started).inSeconds >= 10) {
           final counts = await ask(
               "(function(){var l=(window.__gv&&window.__gv.log)||[];var s=0,p=0;l.forEach(function(e){if(e.sabr)s++;else if(e.mime)p++;});return s+'|'+p;})()");
@@ -3499,8 +3317,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return null;
   }
 
-  // HLS: YouTube's iPhone app also gets the song as an HLS playlist (many small
-  // parts), which is not blocked like the plain links are. Returns its address.
   Future<String?> _hlsManifestFor(String vid) async {
     final clients = <Map<String, dynamic>>[
       {
@@ -3568,7 +3384,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return null;
   }
 
-  // From an HLS master list: the audio-only playlist (quality as chosen).
   Uri? _hlsPickAudio(Uri base, String master, String quality) {
     final audioOnly = <({int bw, Uri uri})>[];
     final renditions = <Uri>[];
@@ -3628,8 +3443,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return null;
   }
 
-  // YouTube's "UMP" wrapper: a list of parts (type, size, data). Part 21 holds
-  // the audio bytes (after one id byte). Returns just the audio, joined.
   Uint8List _umpMedia(Uint8List d) {
     final out = BytesBuilder(copy: false);
     var i = 0;
@@ -3671,8 +3484,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return out.takeBytes();
   }
 
-  // MPEG-TS -> the raw AAC (ADTS) audio inside it. [pids] remembers which
-  // stream is the audio between parts.
   Uint8List _tsToAdts(Uint8List d, Set<int> pids) {
     final out = BytesBuilder(copy: false);
     for (var i = 0; i + 188 <= d.length; i += 188) {
@@ -3703,8 +3514,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return out.takeBytes();
   }
 
-  // Asks YouTube's iPhone app endpoint for the audio links directly. Used only
-  // when the library's own links are refused. Returns (url, bytes) or null.
   Future<({Uri url, int size})?> _iosAppAudioLink(String vid, int wantBytes,
       {required bool smallest, required bool middle}) async {
     final res = await http
@@ -3757,7 +3566,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         ? audio.first
         : (middle ? audio[audio.length ~/ 2] : audio.last);
     for (final f in audio) {
-      // the very same stream as the library found, so a half-done file can go on
+
       if (int.tryParse('${f['contentLength']}') == wantBytes) pick = f;
     }
     final size = int.tryParse('${pick['contentLength']}') ?? 0;
@@ -3765,12 +3574,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return (url: Uri.parse(pick['url'] as String), size: size);
   }
 
-  // iPhone download: asks YouTube for the audio-only stream (AAC / .m4a, which
-  // the iPhone can play) and saves it. No yt-dlp and no ffmpeg needed.
-  // Three ways, each carrying on from what is already saved:
-  //   1) the library's own stream (stops after 12 s without data),
-  //   2) small pieces with the right app identity, retried and re-linked,
-  //   3) the links from YouTube's iPhone app endpoint.
   Future<String> _downloadWithDart(
       String vid, String id, Directory dir, DownloadTask task) async {
     final yt = yt_explode.YoutubeExplode();
@@ -3816,7 +3619,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         if (why.length > 90) why = '${why.substring(0, 90)}...';
         _dl.log('The library could not read this song ($why). Trying the page link...');
       }
-      // Without the library's answer the size comes from the page link.
+
       var total = info?.size.totalBytes ?? (1 << 30);
       var link = info?.url ?? Uri.parse('about:blank');
       if (info != null) {
@@ -3843,7 +3646,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _dl.changed();
       }
 
-      // Starts the file again from byte 0 (used when the stream changes).
       Future<void> restart() async {
         await sink?.close();
         sink = out.openWrite();
@@ -3853,7 +3655,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
       sink = out.openWrite();
 
-      // 1) the library's own stream, with a "no data" watchdog
       Future<void> viaLibrary() async {
         final done = Completer<void>();
         var lastData = DateTime.now();
@@ -3892,14 +3693,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         } finally {
           idle?.cancel();
           hooks.remove(hook);
-          // Not awaited: a stuck stream never finishes closing.
+
           sub?.cancel();
         }
       }
 
-      // 2 + 3) small pieces. Each piece is tried up to 4 times: Range header,
-      // then "&range=" in the link (how the YouTube site asks), then again
-      // after getting a fresh link.
       Future<void> viaPieces(Uri start, String ua,
           {required bool refresh,
           bool post = false,
@@ -3993,7 +3791,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       }
 
       Object? failure = infoError;
-      // 0) the link the YouTube page itself is using for this song
+
       var page = await _pageAudioLink(vid, quiet: true);
       if (page == null) {
         _dl.log('Opening this song in the YouTube page to get its link...');
@@ -4029,7 +3827,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
               'Could not get this song. Play it in the Music tab for a few seconds (let any ad finish), then download it again.');
         }
       }
-      // 0b) HLS playlist from the iPhone app endpoint (many small parts)
+
       Future<bool> viaHls() async {
         _dl.log('Asking YouTube for the HLS playlist...');
         final manifestUrl = await _hlsManifestFor(vid);
@@ -4164,7 +3962,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         throw f is Exception ? f : Exception(f ?? 'Download ended early ($got of $total bytes)');
       }
       if (rawAdts) {
-        // raw AAC from MPEG-TS: give it the ending the player expects
+
         outPath = '${dir.path}/$id.aac';
         await out.rename(outPath);
       }
@@ -4181,7 +3979,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   String _errText(Object e) =>
       e is PlatformException ? (e.message ?? e.code) : e.toString();
 
-  // ---- Playlist folders ------------------------------------------------------
   Future<void> _loadPlaylists() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList('playlists') ?? [];
@@ -4210,7 +4007,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return null;
   }
 
-  // A song belongs to a folder by its file, or by its video id.
   bool _inFolder(PlaylistFolder f, LocalSong s) =>
       f.paths.contains(s.path) || f.known.contains(_vidOf(s));
 
@@ -4238,8 +4034,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return f;
   }
 
-  // Puts every song of the playlist that is already on the phone into the
-  // folder. Songs the person deleted stay in "known", so Update leaves them.
   void _refreshPlaylist(PlaylistFolder f, _PlaylistData pl) {
     if (pl.title.isNotEmpty) f.name = pl.title;
     for (final s in pl.songs) {
@@ -4261,11 +4055,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   void _setSort(int mode) {
     setState(() => _sortMode = mode);
     SharedPreferences.getInstance().then((p) => p.setInt('sort_mode', mode));
-    _touch(); // redraws the open folder
+    _touch();
   }
 
-  // When a song was added: files are named "<microseconds>_...", so the name
-  // tells (works for downloads and added files). Otherwise the file's date.
   int _addedMs(LocalSong s) {
     return _addedCache.putIfAbsent(s.path, () {
       final name = s.path.split('/').last;
@@ -4349,8 +4141,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       } catch (e) {
         _dl.log('Could not read the playlist name ($e)');
       }
-      // YouTube Music request first: youtube_explode's playlist parser returns
-      // 0 songs with YouTube's current format.
+
       songs = await _readPlaylistBrowse(id);
       _dl.log('YouTube Music request found ${songs.length} songs');
       if (songs.isNotEmpty) return _PlaylistData(id, title, songs);
@@ -4395,9 +4186,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return '';
   }
 
-  // Reads a public / unlisted playlist through the YouTube Music (WEB_REMIX)
-  // client. No login needed. Undocumented API: update the version when it
-  // stops working.
   Future<List<Map<String, String>>> _readPlaylistBrowse(String id) async {
     final songs = <Map<String, String>>[];
     final seen = <String>{};
@@ -4459,7 +4247,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           }
         }
       }
-      // Next page token: newer and older response formats.
+
       final c = n['continuationItemRenderer'];
       if (c is Map) {
         final t = c['continuationEndpoint']?['continuationCommand']?['token'];
@@ -4484,7 +4272,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         pages++;
         if (tokens.isEmpty) break;
         final token = tokens.last;
-        if (!used.add(token)) break; // same token again, stop
+        if (!used.add(token)) break;
         data = await post({'continuation': token});
       }
     } catch (e) {
@@ -4596,11 +4384,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _dl.changed();
   }
 
-  // ---- The download list --------------------------------------------------
-  // Everything that waits to be downloaded (playlist songs, the player button,
-  // smart download) goes through here. The list is saved on the phone after
-  // every change, so it carries on after the app was closed.
-
   Future<void> _persistQueue() async {
     final items = <PendingSong>[
       if (_activeSong != null && !_batchCancel) _activeSong!,
@@ -4611,8 +4394,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         'dl_queue', items.map((p) => jsonEncode(p.toJson())).toList());
   }
 
-  // The list was changed from a page (remove / reorder): save it, and clear the
-  // "paused" bar when nothing is left to resume.
   void _queueChanged() {
     _persistQueue();
     if (!_queueRunning && _dl.pending.isEmpty && _dl.onResume != null) {
@@ -4624,7 +4405,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     if (mounted) setState(() {});
   }
 
-  // Cancels the song that is downloading now; the list goes on with the next.
   void _cancelCurrent() {
     final s = _activeSong;
     if (s == null) return;
@@ -4634,8 +4414,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     if (id != null) _cancelDownload(id);
   }
 
-  // Adds songs to the end of the list and starts the worker if it is idle.
-  // Songs already downloaded, downloading or waiting are skipped.
   int _enqueue(Iterable<PendingSong> songs) {
     var n = 0;
     for (final s in songs) {
@@ -4656,8 +4434,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return n;
   }
 
-  // At start: deletes half-finished download files, then puts back the songs
-  // that were waiting (or downloading) when the app was closed.
   Future<void> _loadQueue() async {
     await _cleanLeftovers();
     final prefs = await SharedPreferences.getInstance();
@@ -4667,7 +4443,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         final p = PendingSong.fromJson(jsonDecode(raw) as Map<String, dynamic>);
         if (p.vid.isEmpty) continue;
         if (_alreadyHave(p.vid, p.title, p.artist)) {
-          _linkToFolder(p); // it did finish before the app closed
+          _linkToFolder(p);
           continue;
         }
         if (_activeSong?.vid == p.vid || _dl.pending.any((q) => q.vid == p.vid)) {
@@ -4687,7 +4463,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _pumpQueue();
   }
 
-  // Interrupted downloads leave temporary files behind: remove them.
   Future<void> _cleanLeftovers() async {
     try {
       final docs = await getApplicationDocumentsDirectory();
@@ -4709,7 +4484,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
-  // Puts a finished song into its playlist folder.
   void _linkToFolder(PendingSong s) {
     final id = s.folderId;
     if (id == null) return;
@@ -4722,7 +4496,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _persistPlaylists();
   }
 
-  // The one worker: takes the first waiting song, downloads it, repeats.
   Future<void> _pumpQueue() async {
     if (_queueRunning || !mounted || _dl.pending.isEmpty) return;
     _queueRunning = true;
@@ -4737,8 +4510,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     var outdatedHint = false;
     try {
       while (mounted && _dl.pending.isNotEmpty && !_batchCancel) {
-        // Fresh install (iPhone): wait until the page has been used like a real
-        // listener (signed in, or 15 s of music), so YouTube does not refuse.
+
         if (!_dlWarm) {
           final left = math.max(0, _warmNeedSecs - _warmSecs);
           _dl.batchStatus =
@@ -4747,9 +4519,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           await Future.delayed(const Duration(seconds: 1));
           continue;
         }
-        // Wi-Fi only: wait here (also after the app restarts) and carry on by
-        // itself as soon as Wi-Fi is back.
-        // Same when there is no internet at all: wait, then carry on.
+
         final wifiBlocked = _wifiOnly && !await _onWifi();
         final offline = !wifiBlocked && !await _online();
         if (wifiBlocked || offline) {
@@ -4800,7 +4570,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         _persistQueue();
         if (_batchCancel) break;
         if (_skipCurrent && t.status != DlStatus.done) {
-          // Cancelled by the person: not a failure, go on with the next song.
+
           _skipCurrent = false;
           t.error = 'Cancelled by you';
           _dl.log('Cancelled: "${s.title}"');
@@ -4826,9 +4596,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           final netErr = _isNetworkError(err);
           final lostWifi = _wifiOnly && !await _onWifi();
           if (lostWifi || (netErr && !await _online())) {
-            // The connection dropped during the song: put it back and wait
-            // for it to return, instead of counting a failure. The partly
-            // downloaded file is kept, so it carries on from there.
+
             if (_lastAttemptId != null) _resumeIds[s.vid] = _lastAttemptId!;
             _dl.pending.insert(0, s);
             _persistQueue();
@@ -4840,7 +4608,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           }
           final tries = _retries[s.vid] ?? 0;
           if (netErr && tries < _retryDelays.length) {
-            // A connection problem while online: try again a bit later.
+
             _retries[s.vid] = tries + 1;
             if (_lastAttemptId != null) _resumeIds[s.vid] = _lastAttemptId!;
             _dl.pending.insert(0, s);
@@ -4891,7 +4659,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
                 vid: s.vid, title: s.title, artist: s.artist, art: s.art);
           }
         }
-        // pause between songs (also lets Stop react quickly)
+
         if (_dl.pending.isNotEmpty && !_batchCancel) {
           final next = _dl.pending.first;
           final secs = (next.folderId != null || next.smart) ? 8 : 2;
@@ -4950,20 +4718,17 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
           _dlProgress = null;
         });
       }
-      // The hidden download page is not needed while nothing is downloading
-      // (it stays while the list is only paused).
+
       if (_dl.pending.isEmpty) _closeDownloadWeb();
     }
-    // Everything has been tried: report what failed.
+
     if (!wasStopped && mounted && _dl.pending.isEmpty) {
       await _afterQueue(pausedReason.isNotEmpty);
     }
   }
 
-  // The list is empty. If playlist songs failed: retry them by themselves
-  // (setting) or list them and ask.
   Future<void> _afterQueue(bool limited) async {
-    // Songs that arrived some other way in the meantime are not failures.
+
     _failedRound.removeWhere(
         (f) => _alreadyHave(f.song.vid, f.song.title, f.song.artist));
     if (_failedRound.isEmpty) {
@@ -4971,7 +4736,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       return;
     }
     if (_retryPromptOpen) return;
-    // Automatic retries (not while YouTube is limiting this connection).
+
     if (_retryAuto && !limited && _autoRound < _autoRoundsMax) {
       _autoRound++;
       final list = _failedRound.map((f) => f.song).toList();
@@ -4986,7 +4751,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
     final gaveUp = _retryAuto && !limited;
     if (!_retryAsk && !gaveUp) {
-      // The person turned the question off: only keep a note in the log.
+
       for (final f in _failedRound) {
         _dl.log('Failed: "${f.song.title}" (${f.reason})', error: true);
       }
@@ -5103,7 +4868,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
   static const List<int> _retryDelays = [5, 15, 30];
 
-  // Errors that usually mean YouTube changed something and yt-dlp is too old.
   bool _looksOutdated(String e) {
     const words = [
       'unable to extract',
@@ -5120,8 +4884,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return words.any(e.contains);
   }
 
-  // Does the yt-dlp error look like a dropped / bad connection (worth trying
-  // again), rather than a video problem or YouTube refusing us?
   bool _isNetworkError(String e) {
     if (e.contains('http error 4') ||
         e.contains('unavailable') ||
@@ -5152,7 +4914,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     return words.any(e.contains);
   }
 
-  // Deletes the half-finished files of a download that is given up.
   Future<void> _dropPartials(String id) async {
     try {
       final docs = await getApplicationDocumentsDirectory();
@@ -5204,7 +4965,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     final id = _activeId;
     if (id != null) _cancelDownload(id);
     if (!_queueRunning) {
-      // paused: nothing is running that could clean up
+
       _batchCancel = false;
       _dl.batchStatus = null;
       _dl.onStopBatch = null;
@@ -5214,8 +4975,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _dl.changed();
   }
 
-  // Download tab -> Add playlist: lists the songs, asks, then downloads them
-  // one at a time with a pause in between (to stay clear of YouTube's limits).
   Future<void> _addPlaylist() async {
     if (_readingPlaylist) {
       _toast('Still reading another playlist, one moment');
@@ -5230,8 +4989,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     await _downloadPlaylistFrom(url);
   }
 
-  // Reads the playlist, asks for confirmation, then downloads the songs one by
-  // one. Used by the Add playlist button and the button on playlist pages.
   Future<void> _downloadPlaylistFrom(String url, {PlaylistFolder? folder}) async {
     if (_readingPlaylist) {
       _toast('Still reading another playlist, one moment');
@@ -5254,8 +5011,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
 
     final songs = pl.songs;
-    // Every song of the playlist that is not on this device is offered, also
-    // the ones the person deleted earlier. The person picks which to download.
+
     final target = folder ?? _playlistById(pl.id);
     final known = target?.known ?? <String>{};
     final todo = songs
@@ -5271,8 +5027,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       return;
     }
     if (todo.isEmpty) {
-      // Nothing to download: still make / refresh the folder from the songs
-      // that are already here.
+
       final pf = target ?? _newPlaylist(pl, url);
       _refreshPlaylist(pf, pl);
       _endReading();
@@ -5285,7 +5040,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       _endReading();
       return;
     }
-    // Add playlist and Update both ask which songs to download.
+
     final picks = await showDialog<List<Map<String, String>>>(
       context: context,
       builder: (ctx) => _SongPickDialog(
@@ -5308,7 +5063,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
     final f = target ?? _newPlaylist(pl, url);
     _refreshPlaylist(f, pl);
-    // The songs join the download list (also while something else downloads).
+
     final added = _enqueue(picks.map((s) => PendingSong(
         s['id']!, s['title']!, s['artist'] ?? '', f.id,
         art: s['art'] ?? '')));
@@ -5332,7 +5087,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // The bookmark button: only saves the current song's link to the list.
   void _saveCurrent() {
     final title = ((_now['title'] as String?) ?? '').trim();
     if (title.isEmpty) {
@@ -5481,7 +5235,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     _persistSaved();
   }
 
-  // Opens a saved song in the site (streams it, needs internet).
   void _playSaved(SavedSong s) {
     if (s.vid.isEmpty) {
       _toast('This song has no link saved');
@@ -5496,9 +5249,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     ..hideCurrentSnackBar()
     ..showSnackBar(SnackBar(content: Text(msg)));
 
-  // Best-effort ad handling: hides promo banners, clicks "Skip", and fast-forwards
-  // and mutes an ad that is playing. YouTube changes its page often, so the
-  // selectors below may need adjusting over time.
   static const _adBlockJs = r'''
 (function () {
   if (window.__adBlockInstalled) return;
@@ -5611,10 +5361,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 })();
 ''';
 
-
-  // Background playback: the site pauses itself when it thinks the page is hidden.
-  // This makes the page always report "visible" and ignores visibility/blur events.
-  // Best effort: the site may change how it checks, and this may stop working.
   static const _keepAliveJs = r'''
 (function () {
   if (window.__bgPlayInstalled) return;
@@ -5642,8 +5388,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 })();
 ''';
 
-  // Downloaded songs: the moment the website starts one of them, its own copy
-  // is paused and the app is told, so the app can play the file instead.
   static const _shadowJs = r'''
 (function () {
   if (window.__shadowInstalled) return;
@@ -5707,7 +5451,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 })();
 ''';
 
-  // Reports the current song to the app (title, artist, artwork, position).
   static const _nowPlayingJs = r'''
 (function () {
   if (window.__nowPlayingInstalled) return;
@@ -5759,7 +5502,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 })();
 ''';
 
-  // Tells the app when the full-screen player page is open or closed.
   static const _playerPageJs = r'''
 (function () {
   if (window.__playerPageInstalled) return;
@@ -5799,7 +5541,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 })();
 ''';
 
-  // Reports the page address whenever it changes (the site never reloads the page).
   static const _pageUrlJs = r'''
 (function () {
   if (window.__pageUrlInstalled) return;
@@ -5817,10 +5558,9 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 })();
 ''';
 
-  // true if a video/audio element is currently playing
   static const _isPlayingJs =
       "(function(){var v=document.querySelector('video');return !!(v && !v.paused && !v.ended);})()";
-  // resume playback if something paused it when the app was left
+
   static const _resumeJs =
       "(function(){var v=document.querySelector('video');if(v && v.paused && !v.ended){v.play();}})()";
 
@@ -5830,8 +5570,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _loadSaved();
     _initWarmup();
-    // iPhone: let the page play inline and start music without a tap
-    // (otherwise the website's player stays silent).
+
     PlatformWebViewControllerCreationParams webParams =
         const PlatformWebViewControllerCreationParams();
     if (WebViewPlatform.instance is WebKitWebViewPlatform) {
@@ -5851,11 +5590,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
             _now = data;
             final v = (data['vid'] as String?) ?? '';
             if (v.isNotEmpty) _nowVid = v;
-            // Redraw the download button when the song changes to / from a
-            // downloaded one.
+
             if (mounted && wasDownloaded != _nowDownloaded) setState(() {});
             _trackPlay(data);
-            // Not passed on while a downloaded copy is standing in for it.
+
             if (_onWebReport(data)) audioHandler.onWebState(data);
           }
         } catch (_) {}
@@ -5871,7 +5609,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         eqState.refresh();
       })
       ..addJavaScriptChannel('PageUrl', onMessageReceived: (msg) {
-        // A playlist page looks like music.youtube.com/playlist?list=...
+
         String? link;
         final uri = Uri.tryParse(msg.message);
         if (uri != null &&
@@ -5902,7 +5640,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       ))
       ..loadRequest(Uri.parse('https://music.youtube.com'));
     if (Platform.isIOS) {
-      // A Safari-like identity, so Google sign-in accepts the page.
+
       _controller.setUserAgent(
           'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1');
     }
@@ -5911,7 +5649,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
       await _controller.clearLocalStorage();
       await _controller.clearCache();
       await _controller.loadRequest(Uri.parse('https://music.youtube.com'));
-      await _closeDownloadWeb(); // it signs in again from the fresh session
+      await _closeDownloadWeb();
       if (_resetWarmOnSession) await _restartWarmup();
     };
     audioHandler.runJs = (js) => _controller.runJavaScript(js);
@@ -5948,7 +5686,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     };
     _dl.onQueueChanged = _queueChanged;
     _loadPlaylists();
-    _loadLocal().then((_) => _loadQueue()); // songs first, then pick up the list
+    _loadLocal().then((_) => _loadQueue());
     _loadSmart();
     _smartTimer =
         Timer.periodic(const Duration(minutes: 5), (_) => _smartKick());
@@ -5972,14 +5710,14 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
     if (state == AppLifecycleState.inactive) {
-      // Remember whether music was playing just before the app is left.
+
       try {
         final r = await _controller.runJavaScriptReturningResult(_isPlayingJs);
         _wasPlaying = r.toString() == 'true';
       } catch (_) {}
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
-      // If the page paused itself on the way out, start it again.
+
       if (_wasPlaying) {
         for (final ms in [300, 1200]) {
           await Future.delayed(Duration(milliseconds: ms));
@@ -5994,16 +5732,10 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
   int _tab = 0;
   int _lastWebTab = 0;
 
-  // Tabs 3 (Download) and 4 (Sound) are pages of the app, not the website.
   bool get _appTab => _tab >= 3;
 
-  // Tabs: 0 Home, 1 Search (explore page), 2 Library, 3 Download (app page),
-  // 4 Personalize sound (app page).
   static const _labels = ['Home', 'Explore', 'Library'];
 
-  // Presses the matching button of the site's own left sidebar (Home / Explore /
-  // Library). This never reloads the page, so music keeps playing and there is
-  // no "leave page" prompt.
   void _goTo(String label) {
     final l = label.toLowerCase().replaceAll("'", '');
     _controller.runJavaScript('''
@@ -6034,16 +5766,12 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
     }
   }
 
-  // Bottom of the screen: the mini player (when it has something to show)
-  // on top of the Home / Search / Library / Download buttons.
   Widget? _bottomBar() {
-    // The nav buttons are hidden while the website's full-screen player is open.
+
     final hideNav = _playerOpen && !_appTab;
-    final offline = _shadowVid != null; // a downloaded copy stands in
-    final onDevice = _localIdx >= 0; // a file from this phone is playing
-    // Download tab: always (it hides itself when nothing plays). Other tabs:
-    // only while a file from this phone is playing, since the website has its
-    // own mini player for online songs.
+    final offline = _shadowVid != null;
+    final onDevice = _localIdx >= 0;
+
     final showMini = _appTab ? true : (hideNav ? offline : onDevice);
     final label = offline
         ? 'Playing offline version'
@@ -6091,8 +5819,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
         body: SafeArea(
           child: Stack(
             children: [
-              // The hidden download page: far outside the screen, so it cannot
-              // be seen or touched, but WebKit still treats it as alive.
+
               if (_dlWebOn && _dlWeb != null)
                 Positioned(
                   left: -4000,
@@ -6131,11 +5858,11 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
                   const PersonalizeSoundPage(),
                 ],
               ),
-              // "Download playlist" button, shown on YouTube Music playlist pages.
+
               if (_playlistUrl != null && !_playerOpen && !_appTab)
                 Positioned(
                   right: 12,
-                  bottom: 84, // above the site's mini player
+                  bottom: 84,
                   child: FloatingActionButton.extended(
                     heroTag: 'dlPlaylist',
                     backgroundColor: Colors.white,
@@ -6148,7 +5875,7 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
                         _readingPlaylist ? 'Reading...' : 'Download playlist'),
                   ),
                 ),
-              // Download + bookmark buttons, shown on the full-screen player page.
+
               if (_playerOpen && !_appTab)
                 Positioned(
                   right: 12,
@@ -6204,8 +5931,6 @@ class _YtMusicPageState extends State<YtMusicPage> with WidgetsBindingObserver {
 
 enum DlStatus { preparing, downloading, saving, done, failed }
 
-/// One download, with everything the Downloading screen shows about it.
-/// Turns a download error into a reason in plain words and ways to fix it.
 ({String why, List<String> fixes, bool reset}) explainDownloadError(String raw) {
   final e = raw.toLowerCase();
   bool has(List<String> words) => words.any(e.contains);
@@ -6309,13 +6034,13 @@ class DownloadTask {
   DlStatus status = DlStatus.preparing;
   int received = 0, total = 0;
   double speedKBs = 0;
-  double? pct; // 0..100 from yt-dlp
+  double? pct;
   int? etaSec;
   String? error;
-  // Plain-words reason and ways to fix it (set when the download fails).
+
   String? why;
   List<String> fixes = const [];
-  bool offerReset = false; // show the "Reset page session" button
+  bool offerReset = false;
   final DateTime startedAt = DateTime.now();
   DateTime? finishedAt;
 
@@ -6348,13 +6073,10 @@ class LogLine {
   const LogLine(this.time, this.text, this.error);
 }
 
-/// Lists every song of a playlist, marks the ones already on the device, and
-/// lets the person tick what to download (or tap "Not downloaded" to tick only
-/// the missing ones, or "All").
 class _SongPickDialog extends StatefulWidget {
   final String playlistName;
   final List<Map<String, String>> songs;
-  final Set<int> downloaded; // indexes in [songs] that are on the device
+  final Set<int> downloaded;
   final Set<String> removedBefore;
 
   const _SongPickDialog({
@@ -6517,7 +6239,7 @@ class _SongPickDialogState extends State<_SongPickDialog> {
 class PendingSong {
   final String vid, title, artist, art;
   final String? folderId;
-  final bool smart; // added by Smart download
+  final bool smart;
   const PendingSong(this.vid, this.title, this.artist, this.folderId,
       {this.art = '', this.smart = false});
 
@@ -6545,13 +6267,12 @@ class DownloadManager extends ChangeNotifier {
   final List<LogLine> logs = [];
   int _nextId = 1;
 
-  /// Set while "Add playlist" is running (shown at the top of Downloading).
-  String? batchStatus; // the download list is running / paused
-  String? readingStatus; // a playlist link is being read
+  String? batchStatus;
+  String? readingStatus;
   VoidCallback? onStopBatch;
-  VoidCallback? onResume; // set while the list is paused
-  VoidCallback? onCancelCurrent; // set while a song is downloading
-  VoidCallback? onQueueChanged; // saves the list to the phone
+  VoidCallback? onResume;
+  VoidCallback? onCancelCurrent;
+  VoidCallback? onQueueChanged;
   final List<PendingSong> pending = [];
 
   List<DownloadTask> activeFor(String? folderId) => tasks
@@ -6571,8 +6292,6 @@ class DownloadManager extends ChangeNotifier {
     }
   }
 
-  /// Removes the waiting songs of one folder (null = every folder) and cancels
-  /// the song downloading now if it belongs there.
   void cancelFolder(String? folderId) {
     final before = pending.length;
     pending.removeWhere((p) => folderId == null || p.folderId == folderId);
@@ -6616,7 +6335,6 @@ class DownloadManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// One line for the folder tile on the Download page.
   String get summary {
     final active = tasks.where((t) => !t.finished).toList();
     if (batchStatus != null) {
@@ -6636,7 +6354,6 @@ class DownloadManager extends ChangeNotifier {
   }
 }
 
-/// The "Downloading" folder: what is downloading now, and a log of what happened.
 class DownloadingPage extends StatelessWidget {
   final DownloadManager manager;
   const DownloadingPage({super.key, required this.manager});
@@ -6650,7 +6367,6 @@ class DownloadingPage extends StatelessWidget {
     final failed = t.status == DlStatus.failed;
     final done = t.status == DlStatus.done;
 
-    // null = animated "working..." bar (while preparing / saving)
     double? value;
     if (done) {
       value = 1;
@@ -6944,7 +6660,7 @@ class DownloadingPage extends StatelessWidget {
                     : Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          // newest first
+
                           for (final l in logs.reversed)
                             Padding(
                               padding: const EdgeInsets.only(bottom: 4),
@@ -7014,7 +6730,7 @@ class SettingsPage extends StatelessWidget {
               _StorageCard(onTap: onStorage),
               const SizedBox(height: 12),
               _BackupCard(onBackup: onBackup, onRestore: onRestore),
-              // iPhone downloads without yt-dlp, so there is nothing to update.
+
               if (!Platform.isIOS) ...[
                 const SizedBox(height: 12),
                 _YtDlpCard(onCheck: onCheckYtDlp),
@@ -7159,7 +6875,7 @@ class _SmartDownloadCard extends StatelessWidget {
 
 class _DownloadSettingsCard extends StatelessWidget {
   final bool wifiOnly;
-  final String quality; // high | medium | small
+  final String quality;
   final ValueChanged<bool> onWifiOnly;
   final ValueChanged<String> onQuality;
   final bool resetWarm;
@@ -7187,8 +6903,6 @@ class _DownloadSettingsCard extends StatelessWidget {
         '128 kbps: about 1 MB per minute. Roughly half the space of High and fine for most listening.',
   };
 
-  // iPhone: the song is saved as it comes from YouTube (M4A), so the choice
-  // picks the matching audio quality YouTube offers, not an exact bitrate.
   static const _iosHints = {
     'high': 'Best quality YouTube offers, biggest files.',
     'medium': 'A middle choice between size and quality.',
@@ -7425,8 +7139,6 @@ String _fmtBytes(int b) {
   return '${(mb / 1024).toStringAsFixed(2)} GB';
 }
 
-/// Settings -> Storage: how much space downloaded songs use, and a way to free
-/// it. Songs are ticked first and only deleted after a confirmation.
 class StoragePage extends StatefulWidget {
   final List<LocalSong> Function() songs;
   final int Function(LocalSong) addedMs;
@@ -7454,7 +7166,7 @@ class _StoragePageState extends State<StoragePage> {
   Map<String, int> _sizes = {};
   bool _loading = true;
   bool _deleting = false;
-  int _sort = 0; // 0 biggest first, 1 longest since played first
+  int _sort = 0;
   final Set<String> _sel = {};
 
   @override
@@ -7489,8 +7201,6 @@ class _StoragePageState extends State<StoragePage> {
 
   int _size(LocalSong s) => _sizes[s.path] ?? 0;
 
-  // The later of "last played" and "added": a song never played counts from
-  // the day it was added.
   int _lastUsed(LocalSong s) {
     final p = widget.lastPlayedMs(s) ?? 0;
     final a = widget.addedMs(s);
@@ -7724,7 +7434,6 @@ class _StoragePageState extends State<StoragePage> {
   }
 }
 
-/// A song kept in the Downloads list (title, artist, thumbnail and link).
 class SavedSong {
   final String vid, title, artist, art;
   const SavedSong(
@@ -7744,7 +7453,6 @@ class SavedSong {
       );
 }
 
-/// A song file copied onto the phone, with its cover image (if it had one).
 class LocalSong {
   final String title, artist, path, art;
   final bool uploaded;
@@ -7772,18 +7480,16 @@ class LocalSong {
       );
 }
 
-/// What reading a playlist link gives back.
 class _PlaylistData {
   final String id, title;
   final List<Map<String, String>> songs;
   _PlaylistData(this.id, this.title, this.songs);
 }
 
-/// A folder for one downloaded playlist.
 class PlaylistFolder {
   String id, name, url;
-  final Set<String> known; // video ids seen in the playlist at the last update
-  final Set<String> paths; // song files that belong to it
+  final Set<String> known;
+  final Set<String> paths;
 
   PlaylistFolder({
     required this.id,
@@ -7822,13 +7528,11 @@ Widget _localThumb(LocalSong s) {
       errorBuilder: (_, __, ___) => DownloadPage._box());
 }
 
-/// The Downloads page: folders (Download = every song, plus one per playlist)
-/// and the saved-links list.
 class DownloadPage extends StatelessWidget {
   final List<PlaylistFolder> playlists;
-  final List<LocalSong> Function(PlaylistFolder?) songsOf; // null = all songs
+  final List<LocalSong> Function(PlaylistFolder?) songsOf;
   final VoidCallback onAdd;
-  final void Function(PlaylistFolder?) onOpenFolder; // null = Download
+  final void Function(PlaylistFolder?) onOpenFolder;
   final void Function(PlaylistFolder) onRemoveFolder;
 
   final List<SavedSong> songs;
@@ -7897,8 +7601,6 @@ class DownloadPage extends StatelessWidget {
       overflow: TextOverflow.ellipsis,
       style: const TextStyle(color: Colors.white54, fontSize: 13));
 
-  // Cover of a folder card: a 2x2 mosaic of song covers (4 or more songs with
-  // a cover), a single cover, or a grey square with an icon when empty.
   Widget _cover(List<LocalSong> list, IconData emptyIcon) {
     final arts = list.where((s) => s.art.isNotEmpty).take(4).toList();
     Widget img(LocalSong s) => Image.file(File(s.art),
@@ -7944,7 +7646,6 @@ class DownloadPage extends StatelessWidget {
         ),
       );
 
-  // One folder, drawn like a YouTube Music playlist card.
   Widget _folderCard({
     required double width,
     required Widget cover,
@@ -8339,11 +8040,9 @@ class _CircleButton extends StatelessWidget {
   }
 }
 
-/// What is inside one folder: the Download folder (all songs) or a playlist
-/// folder, which also has an Update button.
 class FolderPage extends StatelessWidget {
   final String title;
-  final Listenable refresh; // redraws the list when songs change
+  final Listenable refresh;
   final List<LocalSong> Function() songs;
   final LocalSong? Function() playing;
   final void Function(List<LocalSong>, int) onPlay;
@@ -8354,7 +8053,7 @@ class FolderPage extends StatelessWidget {
   final String? folderId;
   final int Function() sortMode;
   final void Function(int) onSort;
-  final ValueNotifier<String> query; // the search box above the list
+  final ValueNotifier<String> query;
   final void Function(List<LocalSong>) onShuffle;
 
   static const sortNames = [
@@ -8590,7 +8289,6 @@ class FolderPage extends StatelessWidget {
   }
 }
 
-/// The search box at the top of a folder page.
 class _FolderSearchField extends StatefulWidget {
   final ValueNotifier<String> query;
   const _FolderSearchField({required this.query});
@@ -8645,7 +8343,6 @@ class _FolderSearchFieldState extends State<_FolderSearchField> {
   }
 }
 
-/// The "Sound" tab: equaliser with ready-made profiles and your own.
 class PersonalizeSoundPage extends StatelessWidget {
   const PersonalizeSoundPage({super.key});
 
@@ -8726,8 +8423,6 @@ class PersonalizeSoundPage extends StatelessWidget {
     );
   }
 
-  // Asks the website's script how it is doing and shows the answer, so we can
-  // see why the streaming effects do or do not work.
   Future<void> _resetPageSession(BuildContext context) async {
     final go = await showDialog<bool>(
       context: context,
@@ -9120,17 +8815,12 @@ class PersonalizeSoundPage extends StatelessWidget {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Mini player (bottom of the Download page) + full-screen player
-// ---------------------------------------------------------------------------
-
 String _fmt(Duration d) {
   final m = d.inMinutes;
   final s = (d.inSeconds % 60).toString().padLeft(2, '0');
   return '$m:$s';
 }
 
-/// Cover art for whatever is playing (file on the phone or a web link).
 Widget _nowArt(MediaItem item, {double? size}) {
   Widget box() => Container(
         width: size,
@@ -9155,7 +8845,6 @@ Widget _nowArt(MediaItem item, {double? size}) {
       errorBuilder: (_, __, ___) => box());
 }
 
-/// Rebuilds a few times a second with the current playback position.
 class _PositionBuilder extends StatefulWidget {
   final Widget Function(BuildContext, Duration) builder;
   const _PositionBuilder({required this.builder});
@@ -9199,10 +8888,8 @@ void _openNowPlaying(BuildContext context) {
   ));
 }
 
-/// Like the YouTube Music mini player: cover, title, pause and next.
-/// Tapping anywhere else on it opens the full player.
 class MiniPlayer extends StatelessWidget {
-  /// Small line above the bar, e.g. "Playing offline version".
+
   final String? label;
   const MiniPlayer({super.key, this.label});
 
@@ -9249,7 +8936,7 @@ class MiniPlayer extends StatelessWidget {
                           ],
                         ),
                       ),
-                    // thin progress line on top
+
                     _PositionBuilder(builder: (_, pos) {
                       final total = item.duration?.inMilliseconds ?? 0;
                       final v = total > 0
@@ -9317,7 +9004,6 @@ class MiniPlayer extends StatelessWidget {
   }
 }
 
-/// The full-screen player: big cover, seek bar, previous / play-pause / next.
 class NowPlayingPage extends StatelessWidget {
   const NowPlayingPage({super.key});
 
@@ -9446,8 +9132,6 @@ class NowPlayingPage extends StatelessWidget {
   }
 }
 
-/// Shuffle, repeat and sleep timer buttons under the player controls.
-/// Shuffle and repeat only apply to songs played from the phone.
 class _PlayerOptionsRow extends StatelessWidget {
   const _PlayerOptionsRow();
 
@@ -9491,7 +9175,6 @@ class _PlayerOptionsRow extends StatelessWidget {
   }
 }
 
-/// Moon button: opens the sleep timer choices and shows the time left.
 class _SleepButton extends StatefulWidget {
   const _SleepButton();
 
@@ -9594,7 +9277,6 @@ class _SleepButtonState extends State<_SleepButton> {
   }
 }
 
-/// Slider with the current time and the song length.
 class _SeekBar extends StatefulWidget {
   final Duration? duration;
   const _SeekBar({required this.duration});
@@ -9604,7 +9286,7 @@ class _SeekBar extends StatefulWidget {
 }
 
 class _SeekBarState extends State<_SeekBar> {
-  double? _drag; // milliseconds while the thumb is being dragged
+  double? _drag;
 
   @override
   Widget build(BuildContext context) {
@@ -9654,14 +9336,11 @@ class _SeekBarState extends State<_SeekBar> {
   }
 }
 
-// ---- Audio backup: small helper types and dialogs -------------------------------
-
-/// What the person chose in the "Back up" box.
 class _BackupChoice {
-  final bool audio; // include the music files
-  final bool all; // all songs (otherwise only the chosen playlists)
+  final bool audio;
+  final bool all;
   final Set<String> folderIds;
-  final bool loose; // songs that are in no playlist
+  final bool loose;
   const _BackupChoice(
       {required this.audio,
       required this.all,
@@ -9677,8 +9356,8 @@ class _BackupRow {
 
 class _AudioJob {
   final LocalSong song;
-  final String name; // inside the .zip
-  final String? art; // cover image inside the .zip
+  final String name;
+  final String? art;
   final int size;
   const _AudioJob(this.song, this.name, this.art, this.size);
 }
@@ -9696,7 +9375,7 @@ class _ZipSong {
 
 class _Prog {
   final String text;
-  final double? value; // null = no percentage known
+  final double? value;
   const _Prog(this.text, this.value);
 }
 
@@ -9738,8 +9417,6 @@ class _ProgressDialog extends StatelessWidget {
   }
 }
 
-/// "Back up": song list only, or the song list plus the audio files (all of
-/// them, or those of the playlists that are ticked).
 class _BackupOptionsDialog extends StatefulWidget {
   final int totalSongs, totalBytes, looseSongs, looseBytes;
   final List<_BackupRow> rows;
@@ -9873,7 +9550,6 @@ class _BackupOptionsDialogState extends State<_BackupOptionsDialog> {
   }
 }
 
-/// A playlist song whose download failed, and why (plain words).
 class _FailedSong {
   final PendingSong song;
   final String reason;

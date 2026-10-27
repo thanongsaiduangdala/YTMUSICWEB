@@ -1,12 +1,4 @@
-// A small, dependency-free .zip writer and reader for the audio backup.
-//
-// - Files are STORED (not compressed): music is already compressed, and this
-//   keeps the work light on a phone.
-// - Everything is streamed through a small buffer, so a backup of several GB
-//   never has to fit in memory.
-// - Archives bigger than 4 GB are supported (ZIP64 records are added when
-//   needed), so a normal PC unzip tool can open the result.
-// - The reader only understands archives made by this writer (stored entries).
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -25,7 +17,6 @@ final Uint32List _crcTable = () {
   return t;
 }();
 
-/// Continues a CRC-32 over [data]. Start with 0.
 int crc32Update(int crc, Uint8List data) {
   var c = crc ^ 0xFFFFFFFF;
   for (var i = 0; i < data.length; i++) {
@@ -62,7 +53,6 @@ class _WEntry {
   _WEntry(this.name, this.offset, this.crc, this.size, this.time, this.date);
 }
 
-/// Writes a .zip file entry by entry.
 class ZipWriter {
   final RandomAccessFile _raf;
   final List<_WEntry> _entries = [];
@@ -87,8 +77,8 @@ class ZipWriter {
     final h = _Out()
       ..u32(0x04034b50)
       ..u16(20)
-      ..u16(0x0800) // names are UTF-8
-      ..u16(0) // stored
+      ..u16(0x0800)
+      ..u16(0)
       ..u16(_dosTime(t))
       ..u16(_dosDate(t))
       ..u32(crc)
@@ -103,8 +93,6 @@ class ZipWriter {
         _WEntry(name, offset, crc, d.length, _dosTime(t), _dosDate(t)));
   }
 
-  /// Streams [file] into the archive. If anything goes wrong, the partly
-  /// written entry is cut off again and the error is rethrown.
   Future<void> addFile(String name, File file,
       {void Function(int bytes)? onBytes}) async {
     final nb = utf8.encode(name);
@@ -122,7 +110,7 @@ class ZipWriter {
       ..u16(0)
       ..u16(_dosTime(t))
       ..u16(_dosDate(t))
-      ..u32(0) // crc and sizes are filled in after the data
+      ..u32(0)
       ..u32(0)
       ..u32(0)
       ..u16(nb.length)
@@ -162,7 +150,6 @@ class ZipWriter {
     }
   }
 
-  /// Writes the table of contents and closes the file.
   Future<void> close() async {
     try {
       final cdStart = _pos;
@@ -183,10 +170,10 @@ class ZipWriter {
           ..u32(e.size)
           ..u16(nb.length)
           ..u16(big ? 12 : 0)
-          ..u16(0) // comment
-          ..u16(0) // disk
-          ..u16(0) // internal attributes
-          ..u32(0) // external attributes
+          ..u16(0)
+          ..u16(0)
+          ..u16(0)
+          ..u32(0)
           ..u32(big ? 0xFFFFFFFF : e.offset)
           ..bytes(nb);
         if (big) {
@@ -236,7 +223,6 @@ class ZipWriter {
     }
   }
 
-  /// Closes without writing the table of contents (for a cancelled backup).
   Future<void> abort() async {
     try {
       await _raf.close();
@@ -250,7 +236,6 @@ class ZipEntryInfo {
   const ZipEntryInfo(this.name, this.method, this.crc, this.size, this.offset);
 }
 
-/// Reads an archive made by [ZipWriter].
 class ZipReader {
   final RandomAccessFile _raf;
   final Map<String, ZipEntryInfo> _byName;
@@ -265,7 +250,7 @@ class ZipReader {
     try {
       final len = await raf.length();
       if (len < 22) throw const FormatException('Not a zip file');
-      final tailStart = len - math.min(len, 22 + 0xFFFF);
+      final int tailStart = len - math.min<int>(len, 22 + 0xFFFF).toInt();
       await raf.setPosition(tailStart);
       final tail = await raf.read(len - tailStart);
       var e = -1;
@@ -375,7 +360,6 @@ class ZipReader {
         hb.getUint16(28, Endian.little);
   }
 
-  /// Reads a small entry (like the list file) into memory.
   Future<Uint8List> readBytes(ZipEntryInfo e) async {
     if (e.size > 64 * 1024 * 1024) {
       throw const FormatException('Entry is too big to read at once');
@@ -388,8 +372,6 @@ class ZipReader {
     return d;
   }
 
-  /// Copies an entry to [destPath] in small pieces and checks it afterwards.
-  /// The half-written file is removed if anything goes wrong.
   Future<void> extractTo(ZipEntryInfo e, String destPath,
       {void Function(int bytes)? onBytes}) async {
     RandomAccessFile? out;
@@ -427,7 +409,6 @@ class ZipReader {
   }
 }
 
-/// True if the file starts with the zip signature.
 Future<bool> looksLikeZip(String path) async {
   try {
     final raf = await File(path).open();
