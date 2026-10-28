@@ -156,6 +156,9 @@ class EqSettings extends ChangeNotifier {
 
   double boostDb = 0;
 
+  /// iPhone: stream through the re-rendering tap (webTapJs). Off by default.
+  bool tapOn = false;
+
   double fxWide = 0, fxBass = 0, fxClarity = 0, fxRoom = 0;
   String fxId = 'off';
   Timer? _applyTimer;
@@ -276,6 +279,7 @@ class EqSettings extends ChangeNotifier {
     try {
       final p = await SharedPreferences.getInstance();
       enabled = p.getBool('eq_on') ?? false;
+      tapOn = p.getBool('tap_on') ?? false;
       final b = p.getDouble('boost_db') ?? 0;
       boostDb = b.clamp(0.0, kMaxBoostDb).toDouble();
       selectedId = p.getString('eq_selected') ?? 'flat';
@@ -311,6 +315,7 @@ class EqSettings extends ChangeNotifier {
     try {
       final p = await SharedPreferences.getInstance();
       await p.setBool('eq_on', enabled);
+      await p.setBool('tap_on', tapOn);
       await p.setDouble('boost_db', boostDb);
       await p.setString('eq_selected', selectedId);
       await p.setString('fx_id', fxId);
@@ -337,6 +342,11 @@ class EqSettings extends ChangeNotifier {
 
   void setEnabled(bool on) {
     enabled = on;
+    _changed();
+  }
+
+  void setTapOn(bool on) {
+    tapOn = on;
     _changed();
   }
 
@@ -731,11 +741,21 @@ class WebAudioHandler extends BaseAudioHandler {
     uncoveredSince: 0, uncoveredMedia: 0, coveredSince: 0,
     decoding: 0, lastErr: '',
     stats: { appends: 0, segs: 0, decoded: 0, failed: 0, missedInit: 0,
-             reanchors: 0, fallbacks: 0, driftMs: 0, maxDriftMs: 0 },
+             reanchors: 0, fallbacks: 0, driftMs: 0, maxDriftMs: 0, stalls: 0,
+             maxTickGapMs: 0, maxDecodeMs: 0 },
+    log: [], lastTick: 0, lastCT: -1, lastCTWall: 0, stalled: false, stalledAt: 0, lastCover: null,
     elFn: function () { return document.querySelector('video, audio'); }
   };
-
-  function noteErr(e) { S.lastErr = String(e && e.message || e).slice(0, 160); }
+  var T0 = performance.now();
+  // ring buffer shown by the debug screen: [seconds since start, kind, text]
+  function dbg(k, m) {
+    try {
+      var l = S.log;
+      l.push([Math.round(performance.now() - T0) / 1000, k, String(m).slice(0, 220)]);
+      if (l.length > 500) l.shift();
+    } catch (e) {}
+  }
+  function noteErr(e) { S.lastErr = String(e && e.message || e).slice(0, 160); dbg('error', S.lastErr); }
 
   // ---------------- MP4 parsing ----------------
   function u32(u, o) { return ((u[o] << 24) | (u[o + 1] << 16) | (u[o + 2] << 8) | u[o + 3]) >>> 0; }
@@ -956,6 +976,7 @@ class WebAudioHandler extends BaseAudioHandler {
       if (init.audio) {
         init.u = u.slice(0, init.end);
         st.init = init;
+        dbg('init', init.audio.codec + ' ' + init.audio.rate + 'Hz ch' + init.audio.ch + ' aot' + (init.audio.ascInfo ? init.audio.ascInfo.aot : '?') + ' scale ' + init.audio.scale);
         st.kind = 'audio';
         if (S.list.indexOf(st) < 0) {
           S.list.push(st);
@@ -965,7 +986,7 @@ class WebAudioHandler extends BaseAudioHandler {
     }
     if (types.indexOf('moof') >= 0) {
       if (st.kind === 'audio' || (!st.kind && /^audio\//i.test(st.mime))) {
-        if (!st.init) { S.stats.missedInit++; return; }
+        if (!st.init) { S.stats.missedInit++; dbg('missed-init', 'media segment without an init segment'); return; }
         addSegments(st, u, sb.timestampOffset || 0);
       }
     }
@@ -992,6 +1013,7 @@ class WebAudioHandler extends BaseAudioHandler {
       });
       st.segs.push(seg);
       st.bytes += seg.cost;
+      dbg('seg', seg.t0.toFixed(2) + '-' + seg.t1.toFixed(2) + ' n=' + seg.samples.length + ' ' + Math.round(u.length / 1024) + 'KB');
       S.stats.segs++;
     });
     st.segs.sort(function (a, b) { return a.t0 - b.t0; });
@@ -1001,6 +1023,7 @@ class WebAudioHandler extends BaseAudioHandler {
   function onRemove(sb, a, b) {
     var st = S.sbs.get(sb);
     if (!st || !st.segs.length) return;
+    dbg('remove', (+a).toFixed(2) + '-' + (+b).toFixed(2));
     st.segs = st.segs.filter(function (g) {
       if (g.t0 >= a - 0.02 && g.t1 <= b + 0.02) { dropSeg(st, g); return false; }
       return true;
@@ -1134,6 +1157,7 @@ class WebAudioHandler extends BaseAudioHandler {
     var trk = seg.init.audio, asc = trk.ascInfo;
     var canAdts = S.mode === 'adts' && asc && asc.aot === 2 && asc.fi <= 12 && asc.ch >= 1 && asc.ch <= 2;
     seg.busy = true; S.decoding++;
+    var tDec = performance.now();
     var work;
     if (canAdts) {
       var prev = prevContiguous(seg), parts = [], pre = 0, i;
@@ -1152,13 +1176,17 @@ class WebAudioHandler extends BaseAudioHandler {
       work = decodeFmp4(seg);
     }
     work.then(function () {
+      var ms = Math.round(performance.now() - tDec);
+      if (ms > S.stats.maxDecodeMs) S.stats.maxDecodeMs = ms;
+      dbg('decoded', seg.t0.toFixed(2) + ' in ' + ms + 'ms' + (seg.noPre ? ' (no preroll)' : '') + ' off=' + seg.off.toFixed(3) + ' delay=' + seg.delay.toFixed(3));
       S.stats.decoded++; S.bad = 0;
     }, function (e) {
       noteErr(e);
+      dbg('decode-fail', seg.t0.toFixed(2) + ' mode=' + S.mode);
       if (S.stats.decoded === 0 && S.mode === 'adts') {
         // nothing decoded yet: after two refusals of raw AAC frames, try whole fMP4 chunks
         S.adtsFails = (S.adtsFails || 0) + 1;
-        if (S.adtsFails >= 2) { S.mode = 'fmp4'; S.lastErr = 'adts refused, using fmp4: ' + S.lastErr; }
+        if (S.adtsFails >= 2) { S.mode = 'fmp4'; dbg('mode', 'raw AAC refused, switching to fmp4'); S.lastErr = 'adts refused, using fmp4: ' + S.lastErr; }
       } else {
         S.stats.failed++; S.bad++; seg.failed = true;
         if (S.bad >= 4) disable('decoding failed: ' + S.lastErr);
@@ -1190,7 +1218,8 @@ class WebAudioHandler extends BaseAudioHandler {
     seg.node = null; seg.gain = null;
   }
 
-  function stopAll() {
+  function stopAll(why) {
+    if (S.anchor) dbg('stop', why || '?');
     S.gen++;
     S.list.forEach(function (st) { st.segs.forEach(killNode); });
     S.anchor = null;
@@ -1198,18 +1227,19 @@ class WebAudioHandler extends BaseAudioHandler {
 
   function disable(why) {
     S.disabled = why;
-    stopAll();
+    dbg('DISABLED', why);
+    stopAll('disabled');
     unmute();
   }
 
   function mute() {
     var v = S.elFn();
     if (!v) return;
-    try { if (!S.muting) S.muting = true; if (!v.muted) v.muted = true; } catch (e) {}
+    try { if (!S.muting) S.muting = true; if (!v.muted) { v.muted = true; dbg('mute', 'page sound muted'); } } catch (e) {}
   }
   function unmute() {
     var v = S.elFn();
-    try { if (v && S.muting && v.muted) v.muted = false; } catch (e) {}
+    try { if (v && S.muting && v.muted) { v.muted = false; dbg('unmute', 'page sound restored'); } } catch (e) {}
     S.muting = false;
   }
 
@@ -1245,16 +1275,35 @@ class WebAudioHandler extends BaseAudioHandler {
     if (!c || !S.sink) return;
     var v = S.elFn();
     if (!S.enabled || S.disabled || !v) {
-      if (S.anchor) stopAll();
+      if (S.anchor) stopAll('tap disabled');
       unmute();
       return;
     }
     var playing = !v.paused && !v.ended && !v.seeking && v.readyState >= 2;
     var rate = v.playbackRate || 1;
     var wall = performance.now() / 1000;
+    // main thread blocked or throttled? (a long gap between two ticks)
+    if (S.lastTick) {
+      var gap = Math.round((wall - S.lastTick) * 1000);
+      if (gap > S.stats.maxTickGapMs) S.stats.maxTickGapMs = gap;
+      if (gap > 600) dbg('tick-gap', gap + 'ms (page busy or throttled) visible=' + document.visibilityState);
+    }
+    S.lastTick = wall;
+    // is the page's own clock stuck while it claims to play?
+    if (playing) {
+      if (Math.abs(v.currentTime - S.lastCT) > 0.01) {
+        if (S.stalled) { dbg('stall-end', 'after ' + (wall - S.stalledAt).toFixed(1) + 's, t=' + v.currentTime.toFixed(2)); S.stalled = false; }
+        S.lastCT = v.currentTime; S.lastCTWall = wall;
+      } else if (!S.stalled && wall - S.lastCTWall > 1.5) {
+        S.stalled = true; S.stalledAt = wall; S.stats.stalls++;
+        var br = ''; try { for (var q = 0; q < v.buffered.length; q++) br += v.buffered.start(q).toFixed(1) + '-' + v.buffered.end(q).toFixed(1) + ' '; } catch (e) {}
+        dbg('STALL', 'page clock frozen at ' + v.currentTime.toFixed(2) + ' readyState=' + v.readyState + ' network=' + v.networkState +
+            ' muted=' + v.muted + ' buffered=[' + br.trim() + '] ctx=' + c.state + ' anchor=' + !!S.anchor + ' fallback=' + S.fallback);
+      }
+    } else { S.lastCT = -1; if (S.stalled) { S.stalled = false; } }
 
     if (!playing || Math.abs(rate - 1) > 0.001) {
-      if (S.anchor) stopAll();
+      if (S.anchor) stopAll(!playing ? 'not playing (paused=' + v.paused + ' seeking=' + v.seeking + ' ready=' + v.readyState + ')' : 'rate ' + rate);
       if (Math.abs(rate - 1) > 0.001) unmute();
       return;
     }
@@ -1268,13 +1317,14 @@ class WebAudioHandler extends BaseAudioHandler {
     if (!S.anchor) {
       S.anchor = { c: now + 0.08, m: want + 0.08 };
       S.stats.reanchors++;
+      dbg('anchor', 'media ' + want.toFixed(2) + 's ctx=' + c.state + ' rate=' + c.sampleRate);
     } else {
       var drift = want - mediaNow(now);
       S.stats.driftMs = Math.round(drift * 1000);
       if (Math.abs(S.stats.driftMs) > S.stats.maxDriftMs) S.stats.maxDriftMs = Math.abs(S.stats.driftMs);
       if (Math.abs(drift) > DRIFT) {
         S.driftHits = (S.driftHits || 0) + 1;
-        if (S.driftHits >= 3) { S.driftHits = 0; stopAll(); return; }
+        if (S.driftHits >= 3) { S.driftHits = 0; dbg('drift', 'output off by ' + S.stats.driftMs + 'ms, re-anchoring'); stopAll('drift'); return; }
       } else S.driftHits = 0;
     }
 
@@ -1291,16 +1341,22 @@ class WebAudioHandler extends BaseAudioHandler {
       if (g.t1 < mn - 0.05) continue;
       if (!g.buf) { if (!g.failed) pending.push(g); continue; }
       if (!g.node && !g.passed) schedule(g, now);
-      if (g.node && g.t0 <= mn + 0.02 && g.t1 > mn) covered = true;
+      // a suspended / interrupted context (call, Siri, route change) is not covering anything
+      if (g.node && c.state === 'running' && g.t0 <= mn + 0.02 && g.t1 > mn) covered = true;
     }
     pending.sort(function (a, b) { return Math.abs(a.t0 - mn) - Math.abs(b.t0 - mn); });
     for (i = 0; i < pending.length; i++) decodeSeg(pending[i]);
 
     // mute the page's own sound while we cover it; give it back if we cannot
-    if (S.fallback && wall - S.fallbackAt > 10) S.fallback = false;
+    if (S.fallback && wall - S.fallbackAt > 10) { S.fallback = false; dbg('fallback-off', 'retry after 10s'); }
+    if (S.lastCover !== covered) {
+      var nd = 0; segs.forEach(function (g) { if (g.buf) nd++; });
+      dbg(covered ? 'covered' : 'UNCOVERED', 'media ' + mn.toFixed(2) + ' segs=' + segs.length + ' decoded=' + nd + ' pending=' + pending.length + ' decoding=' + S.decoding + ' ctx=' + c.state);
+      S.lastCover = covered;
+    }
     if (covered) {
       S.uncoveredSince = 0; S.coveredSince = S.coveredSince || wall;
-      if (S.fallback && wall - S.coveredSince > 0.8) S.fallback = false;
+      if (S.fallback && wall - S.coveredSince > 0.8) { S.fallback = false; dbg('fallback-off', 'tap covers the sound again'); }
       if (!S.fallback) mute();
     } else {
       S.coveredSince = 0;
@@ -1308,7 +1364,7 @@ class WebAudioHandler extends BaseAudioHandler {
       if (!S.uncoveredSince) { S.uncoveredSince = wall; S.uncoveredMedia = v.currentTime; }
       // only a real problem if the page's clock keeps running without us
       else if (wall - S.uncoveredSince > 2.0 && v.currentTime - S.uncoveredMedia > 1.0 && !S.fallback) {
-        S.fallback = true; S.fallbackAt = wall; S.stats.fallbacks++; unmute();
+        S.fallback = true; S.fallbackAt = wall; S.stats.fallbacks++; dbg('fallback-on', 'no tap audio for 2s while the page clock runs'); unmute();
       }
     }
   }
@@ -1322,7 +1378,8 @@ class WebAudioHandler extends BaseAudioHandler {
     ['seeking', 'seeked', 'waiting', 'pause', 'playing', 'play', 'ratechange',
      'emptied', 'loadstart', 'ended'].forEach(function (n) {
       v.addEventListener(n, function () {
-        if (S.anchor) stopAll();
+        dbg('el:' + n, 't=' + v.currentTime.toFixed(2) + ' ready=' + v.readyState + ' paused=' + v.paused + ' muted=' + v.muted);
+        if (S.anchor) stopAll('event ' + n);
         S.coveredSince = 0; S.uncoveredSince = 0;
         if (n === 'emptied' || n === 'loadstart') S.fallback = false;
       }, true);
@@ -1350,23 +1407,30 @@ class WebAudioHandler extends BaseAudioHandler {
 
   window.__webTap = {
     attach: function (ctx, node) {
-      if (S.ctx !== ctx) { stopAll(); }
+      if (S.ctx !== ctx) {
+        stopAll('new context');
+        try { ctx.addEventListener('statechange', function () { dbg('ctx', 'state ' + ctx.state); }); } catch (e) {}
+        dbg('ctx', 'attached state=' + ctx.state + ' rate=' + ctx.sampleRate);
+      }
       S.ctx = ctx; S.sink = node;
     },
-    detach: function () { stopAll(); unmute(); S.ctx = null; S.sink = null; },
+    detach: function () { stopAll('detach'); unmute(); S.ctx = null; S.sink = null; },
     setEnabled: function (on) {
       on = !!on;
-      if (S.enabled && !on) { stopAll(); unmute(); }
+      if (S.enabled !== on) dbg('enabled', on ? 'tap turned on' : 'tap turned off');
+      if (S.enabled && !on) { stopAll('turned off'); unmute(); }
       S.enabled = on;
       if (on && S.disabled && /decoding failed/.test(S.disabled)) S.disabled = '';
     },
-    setOffset: function (ms) { S.offsetMs = +ms || 0; if (S.anchor) stopAll(); },
+    setOffset: function (ms) { S.offsetMs = +ms || 0; if (S.anchor) stopAll('offset'); },
     rate: function () {
       var v = S.elFn(), st = v ? activeState(v) : null;
       return st && st.init && st.init.audio ? st.init.audio.rate || 0 : 0;
     },
     seen: function () { return S.stats.appends > 0 && S.list.length > 0; },
     status: function (short) { return statusText(short); },
+    log: function () { return S.log; },
+    clearLog: function () { S.log.length = 0; },
     diag: function () {
       var v = S.elFn(), st = v ? activeState(v) : null;
       return {
@@ -1433,6 +1497,7 @@ class WebAudioHandler extends BaseAudioHandler {
   function tapMode() { return cfg().tap === true && !!window.__webTap; }
   function wanted() {
     var c = cfg(), f = c.fx || {};
+    if (c.off) return false;  // the streaming tap is switched off in the settings
     return !!c.on || (c.boost || 0) > 0 ||
         (f.wide || 0) > 0 || (f.bass || 0) > 0 || (f.clarity || 0) > 0 || (f.room || 0) > 0;
   }
@@ -1619,6 +1684,7 @@ class WebAudioHandler extends BaseAudioHandler {
   void pushWebEq() {
     final code = 'window.__webEqCfg=${jsonEncode({
           'tap': Platform.isIOS,
+          'off': Platform.isIOS && !eqState.tapOn,
           'on': eqState.enabled,
           'gains': eqState.gains,
           'boost': eqState.boostDb,
@@ -9209,6 +9275,95 @@ class PersonalizeSoundPage extends StatelessWidget {
     );
   }
 
+  /// Live view of the streaming tap: counters, state and the event log.
+  Future<void> _showTapDebug(BuildContext context) async {
+    Future<Map<String, dynamic>> fetch() async {
+      try {
+        final r = await (audioHandler.runJsResult?.call(
+                    'window.__webTap ? JSON.stringify({status: window.__webTap.status(), diag: window.__webTap.diag(), log: window.__webTap.log().slice(-160)}) : "null"') ??
+                Future.value('"null"'))
+            .timeout(const Duration(seconds: 5));
+        var s = r.toString();
+        if (s.startsWith('"')) {
+          try {
+            s = jsonDecode(s) as String;
+          } catch (_) {}
+        }
+        if (s == 'null') return {'error': 'The tap script is not installed in the page (reload the page).'};
+        return Map<String, dynamic>.from(jsonDecode(s) as Map);
+      } catch (e) {
+        return {'error': 'Could not ask the page: $e'};
+      }
+    }
+
+    String render(Map<String, dynamic> d) {
+      final b = StringBuffer();
+      b.writeln('Setting: tap ${eqState.tapOn ? 'ON' : 'OFF'}, equalizer ${eqState.enabled ? 'on' : 'off'}, boost ${eqState.boostDb.toStringAsFixed(0)} dB');
+      b.writeln('Page report: ${audioHandler.webEqStatus}');
+      if (d['error'] != null) {
+        b.writeln(d['error']);
+        return b.toString();
+      }
+      b.writeln('Tap: ${d['status']}');
+      final g = (d['diag'] as Map?) ?? {};
+      b.writeln('enabled=${g['enabled']} muting=${g['muting']} fallback=${g['fallback']} playing=${g['playing']} disabled="${g['disabled']}"');
+      b.writeln('stream: ${g['codec']} ${jsonEncode(g['asc'])} ctx=${jsonEncode(g['ctx'])}');
+      b.writeln('segments: ${g['segs']} (decoded ${g['decoded']}), cache ${g['cachedMB']} MB, range ${jsonEncode(g['range'])}');
+      b.writeln('stats: ${jsonEncode(g['stats'])}');
+      if ((g['lastError'] ?? '').toString().isNotEmpty) b.writeln('last error: ${g['lastError']}');
+      b.writeln('--- log (newest last) ---');
+      for (final e in (d['log'] as List? ?? const [])) {
+        final l = e as List;
+        b.writeln('${(l[0] as num).toStringAsFixed(1)}s  ${l[1]}  ${l[2]}');
+      }
+      return b.toString();
+    }
+
+    var text = render(await fetch());
+    if (!context.mounted) return;
+    Timer? timer;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setS) {
+        timer ??= Timer.periodic(const Duration(seconds: 1), (_) async {
+          final t = render(await fetch());
+          if (ctx.mounted) setS(() => text = t);
+        });
+        return AlertDialog(
+          title: const Text('Streaming tap debug'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: SingleChildScrollView(
+              reverse: true,
+              child: SelectableText(text,
+                  style: const TextStyle(fontFamily: 'Menlo', fontSize: 10)),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: text));
+                  ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(content: Text('Copied the log')));
+                },
+                child: const Text('Copy')),
+            TextButton(
+                onPressed: () async {
+                  try {
+                    await audioHandler.runJs
+                        ?.call('if(window.__webTap)window.__webTap.clearLog()');
+                  } catch (_) {}
+                },
+                child: const Text('Clear')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+          ],
+        );
+      }),
+    );
+    timer?.cancel();
+  }
+
   Future<void> _checkWebEq(BuildContext context) async {
     String text;
     try {
@@ -9445,6 +9600,21 @@ class PersonalizeSoundPage extends StatelessWidget {
                       const Text(
                           'Works on downloaded songs and on songs streaming from YouTube Music. For a streaming song, the change may take a second to be heard.',
                           style: TextStyle(fontSize: 12, color: Colors.white54)),
+                      if (Platform.isIOS) ...[
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: eqState.tapOn,
+                          onChanged: eqState.setTapOn,
+                          title: const Text('Effects on streaming songs'),
+                          subtitle: const Text(
+                              'Experimental. Plays streaming songs through the equalizer and booster. Turn it off if music gets stuck.'),
+                        ),
+                        TextButton.icon(
+                          onPressed: () => _showTapDebug(context),
+                          icon: const Icon(Icons.bug_report, size: 18),
+                          label: const Text('Streaming debug log'),
+                        ),
+                      ],
                       const SizedBox(height: 8),
                       Text(
                           'Streaming effects: ${audioHandler.webEqStatus.isEmpty ? 'no report from the page yet' : audioHandler.webEqStatus}',
